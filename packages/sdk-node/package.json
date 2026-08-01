@@ -1,0 +1,11 @@
+{
+  "name": "@volar/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "build": "echo \"sdk-node build placeholder - full scaffold in issue 10.1\" && exit 0",
+    "lint": "echo \"sdk-node lint placeholder\" && exit 0",
+    "test": "echo \"sdk-node test placeholder\" && exit 0"
+  }
+}

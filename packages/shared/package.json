@@ -1,0 +1,11 @@
+{
+  "name": "@volar/shared",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "build": "echo \"shared build placeholder\" && exit 0",
+    "lint": "echo \"shared lint placeholder\" && exit 0",
+    "test": "echo \"shared test placeholder\" && exit 0"
+  }
+}
