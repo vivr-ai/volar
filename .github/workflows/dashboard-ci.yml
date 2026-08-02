@@ -1,0 +1,49 @@
+name: Dashboard CI
+
+# Issue 1.5: runs lint, typecheck, and unit tests for apps/dashboard on
+# every PR touching that app or the shared package it depends on. This
+# workflow's job name ("ci") is what gets set as a required status check
+# in the repo's branch protection rules (a one-time GitHub.com setting,
+# not something expressible in this file) — see Epic 1's Conventions.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/dashboard/**"
+      - "packages/shared/**"
+      - ".github/workflows/dashboard-ci.yml"
+
+concurrency:
+  group: dashboard-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm --filter @volar/dashboard lint
+
+      - name: Typecheck
+        run: pnpm --filter @volar/dashboard typecheck
+
+      - name: Test
+        run: pnpm --filter @volar/dashboard test
