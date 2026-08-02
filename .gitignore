@@ -17,6 +17,10 @@ next-env.d.ts
 .env.*.local
 !.env.example
 
+# supabase local dev
+supabase/.branches
+supabase/.temp
+
 # python
 __pycache__/
 *.pyc

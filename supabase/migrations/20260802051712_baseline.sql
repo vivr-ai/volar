@@ -1,0 +1,6 @@
+-- Empty baseline migration.
+--
+-- Intentionally empty: this establishes the migrations/ directory and the
+-- migration-history baseline before any real schema exists (issue 1.4).
+-- The first real schema migration (Organization + User tables) lands in
+-- issue 2.2.
