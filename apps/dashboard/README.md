@@ -14,3 +14,4 @@ pnpm --filter @volar/dashboard dev
 
 Currently a placeholder home page only. Real screens are built starting
 with Epic 11 (App Shell & Navigation) and Epic 12 (Onboarding/Install).
+
