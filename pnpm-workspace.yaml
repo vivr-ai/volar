@@ -1,5 +1,6 @@
 packages:
   - "apps/dashboard"
   - "apps/proxy"
+  - "packages/config"
   - "packages/sdk-node"
   - "packages/shared"

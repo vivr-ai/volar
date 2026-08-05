@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "//": "Shared tsconfig base (issue 1.10). Only settings that are safe to be identical across every app live here — module/moduleResolution/target are deliberately left out because apps/dashboard (Next.js, bundler resolution) and apps/proxy (plain Node/ESM, NodeNext resolution) have genuinely different, correct requirements. See packages/config/README.md.",
+  "compilerOptions": {
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  }
+}

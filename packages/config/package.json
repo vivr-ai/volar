@@ -1,0 +1,16 @@
+{
+  "name": "@volar/config",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./prettier/index.mjs",
+  "exports": {
+    "./eslint/base": "./eslint/base.mjs",
+    "./prettier": "./prettier/index.mjs",
+    "./typescript/base": "./typescript/base.json"
+  },
+  "dependencies": {
+    "@eslint/js": "^9",
+    "globals": "^17.9.0",
+    "typescript-eslint": "^8"
+  }
+}

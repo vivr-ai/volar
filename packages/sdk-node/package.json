@@ -5,7 +5,11 @@
   "main": "index.js",
   "scripts": {
     "build": "echo \"sdk-node build placeholder - full scaffold in issue 10.1\" && exit 0",
-    "lint": "echo \"sdk-node lint placeholder\" && exit 0",
+    "lint": "eslint .",
     "test": "echo \"sdk-node test placeholder\" && exit 0"
+  },
+  "devDependencies": {
+    "@volar/config": "workspace:*",
+    "eslint": "^9"
   }
 }
