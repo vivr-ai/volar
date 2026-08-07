@@ -2,5 +2,6 @@ packages:
   - "apps/dashboard"
   - "apps/proxy"
   - "packages/config"
+  - "packages/internal-cli"
   - "packages/sdk-node"
   - "packages/shared"

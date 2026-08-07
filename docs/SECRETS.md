@@ -29,6 +29,7 @@ not even old/rotated ones.
 | `NEXT_PUBLIC_SENTRY_DSN` | dashboard | Vercel (Preview + Production) | Reserved for issue 19.1 |
 | `SUPABASE_URL` | proxy | Railway (staging + production) | Reserved for Epic 5/6 |
 | `SUPABASE_SERVICE_ROLE_KEY` | proxy | Railway (staging + production) | Reserved for Epic 5/6 — **never** give this to the dashboard; it bypasses RLS entirely |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | `packages/internal-cli` (issue 4.5) | Local-only `.env`, never deployed to any platform | Live — used only when a team member runs the price-table CLI by hand |
 | `UPSTASH_REDIS_REST_URL` / `_TOKEN` | proxy | Railway (staging + production) | Reserved for Epic 7 |
 | `SENTRY_DSN` | proxy | Railway (staging + production) | Reserved for issue 19.2 |
 | `AXIOM_TOKEN` | proxy | Railway (staging + production) | Reserved for issue 19.3 |
