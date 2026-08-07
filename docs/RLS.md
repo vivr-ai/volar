@@ -1,12 +1,13 @@
-# Row Level Security — Organizations, Users, Projects, API Keys, Tags & PriceTable
+# Row Level Security — Organizations, Users, Projects, API Keys, Tags, PriceTable & LLMCallEvent
 
-Issues 2.2 (Epic 2), 3.1, 3.2, 3.4 (Epic 3), and 4.1 (Epic 4). Documents
-the RLS design for `public.organizations`, `public.users`,
-`public.projects`, `public.api_keys`, `public.customer_tags`,
-`public.feature_tags`, and `public.price_table`, and the isolation test
-that must be re-run before every future migration touching these tables
-(per issue 2.2's explicit Definition of Done, which this project extends
-the same discipline to).
+Issues 2.2 (Epic 2), 3.1, 3.2, 3.4 (Epic 3), 4.1 (Epic 4), and 5.1
+(Epic 5). Documents the RLS design for `public.organizations`,
+`public.users`, `public.projects`, `public.api_keys`,
+`public.customer_tags`, `public.feature_tags`, `public.price_table`, and
+`public.llm_call_events`, and the isolation test that must be re-run
+before every future migration touching these tables (per issue 2.2's
+explicit Definition of Done, which this project extends the same
+discipline to).
 
 ## Tables
 
@@ -226,3 +227,47 @@ directly — a duplicate insert failed with `duplicate key value violates
 unique constraint "price_table_provider_model_version_key"`.
 `get_advisors` clean apart from the same pre-existing, unrelated Auth
 warning.
+
+## LLMCallEvent (issue 5.1)
+
+`public.llm_call_events` is the core ingested-event table (PRD §7) —
+every dashboard number in V1 is ultimately derived from these rows.
+Scoped by `project_id` (not a direct `organization_id` column), same
+join-through-`projects` SELECT policy pattern as `api_keys` and the
+tag tables:
+
+```sql
+using (
+  exists (
+    select 1 from public.projects p
+    where p.id = llm_call_events.project_id
+      and p.organization_id = private.current_user_organization_id()
+  )
+)
+```
+
+No INSERT/UPDATE/DELETE policy exists for `authenticated`/`anon` — this
+table is written exclusively by `apps/proxy`'s ingestion code (issue
+5.2+), using the `SUPABASE_SERVICE_ROLE_KEY` reserved for the proxy
+since issue 1.9, which bypasses RLS entirely rather than going through
+a SECURITY DEFINER function. This mirrors `price_table`'s write path.
+
+`computed_cost_usd` is nullable by design, not just optional — issue
+5.3 requires a null cost (with an internal alert) rather than a failed
+insert when no PriceTable entry resolves for a given provider/model. A
+`check (computed_cost_usd >= 0)` still guards against a negative value
+whenever it is present.
+
+Isolation re-test, one event seeded per org's existing test project
+(33333333.../Org A, 44444444.../Org B):
+
+As User A, `select project_id, provider, model, customer_id from
+public.llm_call_events` returned only Org A's event
+(`project_id = 33333333-...`, `customer_id = 'cust-a'`) — Org B's row
+never appeared. As User B, only Org B's event appeared. A follow-up
+`insert` as `authenticated` (User A, into User A's own project)
+correctly failed with `new row violates row-level security policy for
+table "llm_call_events"`, confirming writes are denied entirely for
+that role, not just filtered. `get_advisors` clean apart from the same
+pre-existing, unrelated Auth warning. Both disposable test rows were
+deleted after verification.
