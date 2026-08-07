@@ -1,9 +1,10 @@
-# Row Level Security — Organizations, Users & Projects
+# Row Level Security — Organizations, Users, Projects & API Keys
 
-Issues 2.2 (Epic 2) and 3.1 (Epic 3). Documents the RLS design for
-`public.organizations`, `public.users`, and `public.projects`, and the
-isolation test that must be re-run before every future migration
-touching these tables (per issue 2.2's explicit Definition of Done,
+Issues 2.2 (Epic 2), 3.1, and 3.2 (Epic 3). Documents the RLS design for
+`public.organizations`, `public.users`, `public.projects`, and
+`public.api_keys`, and the isolation test that must be re-run before
+every future migration touching these tables (per issue 2.2's explicit
+Definition of Done,
 which this project extends the same discipline to).
 
 ## Tables
@@ -100,3 +101,52 @@ User B, only Project B. Confirmed via the same role-simulation procedure
 above. `get_advisors` (security) came back clean apart from the
 pre-existing, unrelated "leaked password protection disabled" Auth
 warning (not part of this issue's scope).
+
+## API Keys (issue 3.2)
+
+`public.api_keys` has no `organization_id` column of its own — it scopes
+through `project_id`, so its SELECT policy joins to `public.projects`
+instead of comparing a column directly:
+
+```sql
+using (
+  exists (
+    select 1 from public.projects p
+    where p.id = api_keys.project_id
+      and p.organization_id = private.current_user_organization_id()
+  )
+)
+```
+
+This is safe from recursion (it queries a different table, not itself),
+and `projects`' own RLS policy still applies to this subquery when run
+as `authenticated`, so the two layers agree rather than conflict.
+
+**Column-level restriction (AC2):** RLS controls which *rows* a role can
+see, not which *columns* — so hiding `hashed_key` from any future
+client-facing query needed a separate mechanism: `authenticated` and
+`anon` had `SELECT` fully revoked on `api_keys`, then re-granted only for
+the non-secret columns (`id`, `project_id`, `key_prefix`, `created_at`,
+`last_used_at`, `revoked_at`, `rotated_from_key_id`). Verified directly —
+`select hashed_key from public.api_keys` as `authenticated` returns
+`permission denied for table api_keys`, not just an empty/filtered
+result. Whatever eventually verifies a presented key against its hash
+(issue 3.3, called from the proxy service) runs with elevated
+`service_role` privileges, which bypass this restriction entirely, so
+real key verification is unaffected.
+
+Isolation re-test, one key seeded per org's project:
+
+| Key | Project | Org |
+|---|---|---|
+| `55555555-5555-5555-5555-555555555555` (`vlr_live_aaaa`) | Project A | Org A |
+| `66666666-6666-6666-6666-666666666666` (`vlr_live_bbbb`) | Project B | Org B |
+
+As User A, only Project A's key was visible. `get_advisors` clean apart
+from the same pre-existing, unrelated Auth warning.
+
+**Deliberately not enforced here:** PRD §7 notes "one active key per
+Project," but that's left to application logic (issues 3.3/6.2/16.2),
+not a DB constraint — the 24-hour rotation grace period (US-5.1 AC2)
+requires the old and new key to both validate simultaneously for a day,
+which a strict "one non-revoked key" uniqueness constraint would break.
