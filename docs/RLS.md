@@ -1,11 +1,12 @@
-# Row Level Security — Organizations, Users, Projects, API Keys & Tags
+# Row Level Security — Organizations, Users, Projects, API Keys, Tags & PriceTable
 
-Issues 2.2 (Epic 2), 3.1, 3.2, and 3.4 (Epic 3). Documents the RLS design
-for `public.organizations`, `public.users`, `public.projects`,
-`public.api_keys`, `public.customer_tags`, and `public.feature_tags`, and
-the isolation test that must be re-run before every future migration
-touching these tables (per issue 2.2's explicit Definition of Done,
-which this project extends the same discipline to).
+Issues 2.2 (Epic 2), 3.1, 3.2, 3.4 (Epic 3), and 4.1 (Epic 4). Documents
+the RLS design for `public.organizations`, `public.users`,
+`public.projects`, `public.api_keys`, `public.customer_tags`,
+`public.feature_tags`, and `public.price_table`, and the isolation test
+that must be re-run before every future migration touching these tables
+(per issue 2.2's explicit Definition of Done, which this project extends
+the same discipline to).
 
 ## Tables
 
@@ -142,6 +143,22 @@ comments for why salted SHA-256 rather than bcrypt is the right choice
 for a high-entropy random token like this, as opposed to a human-chosen
 password.
 
+Isolation re-test, one key seeded per org's project:
+
+| Key | Project | Org |
+|---|---|---|
+| `55555555-5555-5555-5555-555555555555` (`vlr_live_aaaa`) | Project A | Org A |
+| `66666666-6666-6666-6666-666666666666` (`vlr_live_bbbb`) | Project B | Org B |
+
+As User A, only Project A's key was visible. `get_advisors` clean apart
+from the same pre-existing, unrelated Auth warning.
+
+**Deliberately not enforced here:** PRD §7 notes "one active key per
+Project," but that's left to application logic (issues 3.3/6.2/16.2),
+not a DB constraint — the 24-hour rotation grace period (US-5.1 AC2)
+requires the old and new key to both validate simultaneously for a day,
+which a strict "one non-revoked key" uniqueness constraint would break.
+
 ## Customer & Feature Tags (issue 3.4)
 
 `public.customer_tags` and `public.feature_tags` are lookup tables
@@ -179,18 +196,33 @@ restriction in this project: **always revoke from the specific named
 roles (`anon`, `authenticated`), never rely on `revoke ... from
 public`.**
 
-Isolation re-test, one key seeded per org's project:
+## PriceTable (issue 4.1)
 
-| Key | Project | Org |
-|---|---|---|
-| `55555555-5555-5555-5555-555555555555` (`vlr_live_aaaa`) | Project A | Org A |
-| `66666666-6666-6666-6666-666666666666` (`vlr_live_bbbb`) | Project B | Org B |
+`public.price_table` is the first table that departs from the
+organization-scoped pattern entirely — it's global reference data (the
+same published provider pricing for every customer), not scoped to an
+Organization or Project. RLS is still enabled (consistent with every
+other table here), but the policy is simply "any signed-in user can
+read":
 
-As User A, only Project A's key was visible. `get_advisors` clean apart
-from the same pre-existing, unrelated Auth warning.
+```sql
+create policy "Any authenticated user can read the price table"
+  on public.price_table
+  for select
+  to authenticated
+  using (true);
+```
 
-**Deliberately not enforced here:** PRD §7 notes "one active key per
-Project," but that's left to application logic (issues 3.3/6.2/16.2),
-not a DB constraint — the 24-hour rotation grace period (US-5.1 AC2)
-requires the old and new key to both validate simultaneously for a day,
-which a strict "one non-revoked key" uniqueness constraint would break.
+No INSERT/UPDATE/DELETE policy exists, so those remain denied for
+`authenticated`/`anon` by default — writes are expected to come from
+issue 4.5's internal CLI, run with elevated credentials outside the app.
+
+Verified directly (not assumed, per the 3.4 lesson above): as
+`authenticated`, `select` against a seeded test row succeeded, and a
+follow-up `insert` attempt correctly failed with `new row violates
+row-level security policy for table "price_table"`. The
+`(provider, model, version)` unique constraint was also verified
+directly — a duplicate insert failed with `duplicate key value violates
+unique constraint "price_table_provider_model_version_key"`.
+`get_advisors` clean apart from the same pre-existing, unrelated Auth
+warning.
