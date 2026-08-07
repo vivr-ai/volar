@@ -43,3 +43,38 @@ the Auth REST API using the project's publishable (anon) key:
 Both test users are visible in `Authentication → Users` in the Supabase
 dashboard. These are throwaway test accounts and can be deleted at any
 time without affecting anything else.
+
+## Sign-up auto-provisioning (issue 2.3)
+
+A Postgres trigger (`private.handle_new_auth_user()`, fired by
+`on_auth_user_created after insert on auth.users`) runs immediately after
+every successful sign-up and creates, in the same transaction:
+
+1. An `organizations` row — name defaults to `"<email-local-part>'s
+   Organization"` (no org-name field is collected at sign-up, per the
+   PRD's zero-friction design; this default is a judgment call, easy to
+   change later).
+2. A `public.users` profile row (same id as the `auth.users` row).
+3. A default `projects` row named `"Default Project"`.
+
+**Atomicity:** no exception handling wraps these inserts, so a failure in
+any of them rolls back the entire transaction, including the `auth.users`
+row itself — there is no state where an Organization exists without its
+User/Project, or vice versa.
+
+**Idempotency:** the function returns immediately, doing nothing, if a
+`public.users` row already exists for that auth id — a duplicate trigger
+firing for the same user can never create a second Organization.
+
+**Hardening:** the function initially lived in `public` and was flagged
+by Supabase's security advisor as reachable via
+`/rest/v1/rpc/handle_new_auth_user` (Postgres grants EXECUTE on
+public-schema functions to PUBLIC by default). Moved to the `private`
+schema (introduced in issue 2.2's own hardening fix) — trigger firing
+doesn't require the inserting role to hold EXECUTE on the function, so
+this has no effect on the trigger itself, only on removing it from the
+API surface.
+
+**Verified** with two real sign-ups (one before, one after the hardening
+move) — in both cases exactly one Organization, one User, and one
+Project ("Default Project") were created, correctly linked.
