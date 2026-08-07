@@ -108,3 +108,27 @@ API surface.
 **Verified** with two real sign-ups (one before, one after the hardening
 move) — in both cases exactly one Organization, one User, and one
 Project ("Default Project") were created, correctly linked.
+
+## Account Settings page (issue 2.5)
+
+`apps/dashboard/app/app/account/` — a minimal page at `/app/account` for
+changing password and email, using only default Supabase Auth SDK
+methods (PRD §US-5.3 AC1: "no custom requirements beyond default
+Supabase Auth flows"). This is the Epic 2 (Platform/Backend) version;
+Epic 16 rebuilds it into the fully designed "Account / API Key
+Management" screen on the same route.
+
+- **Password change** re-authenticates via `signInWithPassword()` before
+  calling `updateUser({ password })` — Supabase's `updateUser()` doesn't
+  check the current password on its own (it trusts the active session),
+  so this extra step is what produces a real "current password is
+  incorrect" error, while still only using standard SDK methods.
+- **Email change** calls `updateUser({ email })` directly. Supabase's
+  default "secure email change" behavior requires confirming the change
+  via email before it takes effect, satisfying AC2 as-is — no extra code
+  needed.
+- **Known limitation:** a magic-link-only user (never set a password)
+  will always see "current password is incorrect" when attempting a
+  password change, since there's nothing for `signInWithPassword` to
+  verify. Acceptable for this minimal page; Epic 16.5 is a reasonable
+  place to detect auth provider and adjust the form.
