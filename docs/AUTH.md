@@ -8,6 +8,36 @@ This is dashboard configuration, not code — nothing in this repo reads
 these settings directly, but they gate what `supabase-js` calls succeed
 from `apps/dashboard` once the sign-up UI is built (later Epic 2 issues).
 
+## Dashboard integration (issue 2.4)
+
+`apps/dashboard` now has real Supabase client wiring:
+
+- `lib/supabase/client.ts` — browser client, for Client Components.
+- `lib/supabase/server.ts` — server client, for Server Components/Actions/
+  Route Handlers. Created fresh per request (never cached in module
+  scope).
+- `lib/supabase/proxy.ts` — `updateSession()`, called on every request to
+  refresh the session and redirect unauthenticated requests to `/app/*`
+  routes to `/sign-in`.
+- `proxy.ts` (app root) — Next.js 16's request-boundary file (renamed
+  from `middleware.ts` in Next 16; same concept, runs on the Node.js
+  runtime). Wires `updateSession()` into every request except static
+  assets.
+
+Route protection always uses `supabase.auth.getClaims()`, never
+`getSession()` — `getClaims()` validates the JWT signature against the
+project's published keys on every call, which is what makes it safe to
+trust in server-side route protection; `getSession()` does not
+revalidate and can be spoofed.
+
+Reads `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` (see
+`apps/dashboard/.env.example`). For local dev, `apps/dashboard/.env.local`
+already has the real (non-secret, browser-safe) values — copied from the
+same project referenced throughout this file. Vercel needs the same two
+variables added for both Preview and Production under Project Settings →
+Environment Variables — that's a manual dashboard step, same as the rest
+of Vercel's configuration in this repo.
+
 ## Providers enabled
 
 - **Email** — Supabase's single Email provider covers both password
