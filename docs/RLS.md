@@ -135,6 +135,13 @@ result. Whatever eventually verifies a presented key against its hash
 `service_role` privileges, which bypass this restriction entirely, so
 real key verification is unaffected.
 
+The actual hash format stored in `hashed_key` is
+`<16-byte hex salt>:<sha256 hex digest of salt+key>`, produced by
+`packages/shared`'s `hashApiKey()` (issue 3.3) — see that file's code
+comments for why salted SHA-256 rather than bcrypt is the right choice
+for a high-entropy random token like this, as opposed to a human-chosen
+password.
+
 Isolation re-test, one key seeded per org's project:
 
 | Key | Project | Org |
