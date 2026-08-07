@@ -1,9 +1,10 @@
-# Row Level Security — Organizations & Users
+# Row Level Security — Organizations, Users & Projects
 
-Issue 2.2 (Epic 2). Documents the RLS design for `public.organizations`
-and `public.users`, and the isolation test that must be re-run before
-every future migration touching these tables (per this issue's explicit
-Definition of Done).
+Issues 2.2 (Epic 2) and 3.1 (Epic 3). Documents the RLS design for
+`public.organizations`, `public.users`, and `public.projects`, and the
+isolation test that must be re-run before every future migration
+touching these tables (per issue 2.2's explicit Definition of Done,
+which this project extends the same discipline to).
 
 ## Tables
 
@@ -78,3 +79,24 @@ result. This satisfies issue 2.2's AC2.
 
 The two test orgs/users are harmless fixtures and can be deleted at any
 time; they aren't referenced by anything else.
+
+## Projects (issue 3.1)
+
+`public.projects` follows the identical pattern: RLS enabled, one SELECT
+policy scoped via the same `private.current_user_organization_id()`
+helper, no INSERT/UPDATE/DELETE policy yet (the sign-up trigger in issue
+2.3 creates the default Project as a SECURITY DEFINER operation, so it's
+unaffected).
+
+Isolation re-test, same two test users, one project seeded per org:
+
+| Project | Org |
+|---|---|
+| `33333333-3333-3333-3333-333333333333` ("RLS Test Project A") | Org A |
+| `44444444-4444-4444-4444-444444444444` ("RLS Test Project B") | Org B |
+
+As User A, `select * from public.projects` returned only Project A. As
+User B, only Project B. Confirmed via the same role-simulation procedure
+above. `get_advisors` (security) came back clean apart from the
+pre-existing, unrelated "leaked password protection disabled" Auth
+warning (not part of this issue's scope).
