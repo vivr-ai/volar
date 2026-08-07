@@ -1,10 +1,10 @@
-# Row Level Security — Organizations, Users, Projects & API Keys
+# Row Level Security — Organizations, Users, Projects, API Keys & Tags
 
-Issues 2.2 (Epic 2), 3.1, and 3.2 (Epic 3). Documents the RLS design for
-`public.organizations`, `public.users`, `public.projects`, and
-`public.api_keys`, and the isolation test that must be re-run before
-every future migration touching these tables (per issue 2.2's explicit
-Definition of Done,
+Issues 2.2 (Epic 2), 3.1, 3.2, and 3.4 (Epic 3). Documents the RLS design
+for `public.organizations`, `public.users`, `public.projects`,
+`public.api_keys`, `public.customer_tags`, and `public.feature_tags`, and
+the isolation test that must be re-run before every future migration
+touching these tables (per issue 2.2's explicit Definition of Done,
 which this project extends the same discipline to).
 
 ## Tables
@@ -141,6 +141,43 @@ The actual hash format stored in `hashed_key` is
 comments for why salted SHA-256 rather than bcrypt is the right choice
 for a high-entropy random token like this, as opposed to a human-chosen
 password.
+
+## Customer & Feature Tags (issue 3.4)
+
+`public.customer_tags` and `public.feature_tags` are lookup tables
+populated automatically the first time a given tag string is seen on an
+ingested event — not user-created. Same organization-scoped SELECT
+policy pattern as `api_keys` (join through `project_id` to `projects`).
+
+Two SQL functions do the actual upsert — `upsert_customer_tag(project_id,
+external_id)` and `upsert_feature_tag(project_id, external_id)`. Both are
+idempotent by design: `first_seen_at` is set only by the initial insert
+and never touched by the `ON CONFLICT` branch; `last_seen_at` updates on
+every call. Verified directly: calling the same function twice (in two
+separate transactions, a few seconds apart) left exactly one row, with
+`first_seen_at` unchanged and `last_seen_at` advanced.
+
+**A real mistake, caught by testing rather than assumed away:** the
+original migration tried to restrict these backend-only functions to
+`service_role` with `revoke execute on function ... from public;` —
+mirroring the grant-restriction idea, but using the wrong target. This
+did nothing: Supabase's default privileges grant EXECUTE to the *named*
+roles `anon`, `authenticated`, and `service_role` directly (via `ALTER
+DEFAULT PRIVILEGES`), not to the generic `PUBLIC` pseudo-role — revoking
+"from public" only touches a grant made to that pseudo-role. I only
+caught this because I tested the restriction directly (calling the
+function as `authenticated` after applying it) rather than assuming the
+migration succeeded because it ran without error. It returned a result
+instead of a permission error, which is what caught the bug. Fixed in a
+follow-up migration, `20260807121500_fix_tag_upsert_grants.sql`, revoking
+from `anon, authenticated` by name — re-verified afterward with the same
+live test, which now correctly fails with `permission denied for
+function upsert_customer_tag`.
+
+This is worth remembering for any future function-level grant
+restriction in this project: **always revoke from the specific named
+roles (`anon`, `authenticated`), never rely on `revoke ... from
+public`.**
 
 Isolation re-test, one key seeded per org's project:
 
