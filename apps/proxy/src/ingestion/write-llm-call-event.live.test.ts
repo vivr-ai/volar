@@ -1,10 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createClient } from "@supabase/supabase-js";
 import { writeLlmCallEvent } from "./write-llm-call-event.js";
 import { createSupabaseEventWriteDeps } from "./supabase-event-repository.js";
 
-// Real-network integration test for issue 5.2 -- writes an actual row
-// against a live Supabase project, then deletes it. Skipped unless
+// Real-network integration test for issues 5.2/5.3 -- writes an actual
+// row against a live Supabase project, then deletes it. Skipped unless
 // SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/TEST_PROJECT_ID are set (see
 // apps/proxy/.env.example), since most local/dev/CI environments won't
 // have real Supabase network access or shouldn't be writing test rows
@@ -27,7 +27,11 @@ describe.skipIf(!hasLiveCreds)("writeLlmCallEvent (live Supabase)", () => {
       process.env.SUPABASE_URL as string,
       process.env.SUPABASE_SERVICE_ROLE_KEY as string,
     );
-    const deps = createSupabaseEventWriteDeps(supabase);
+    const alertPriceUnresolved = vi.fn(async () => undefined);
+    const deps = {
+      ...createSupabaseEventWriteDeps(supabase),
+      alertPriceUnresolved,
+    };
 
     // Uses the real seeded Claude Sonnet 5 v1 price (issue 4.2):
     // 1000 * 0.0020/1k + 500 * 0.0100/1k = 0.002 + 0.005 = 0.007
@@ -43,6 +47,38 @@ describe.skipIf(!hasLiveCreds)("writeLlmCallEvent (live Supabase)", () => {
 
     expect(result.costUsd).toBe("0.007");
     expect(result.id).toBeTruthy();
+    expect(alertPriceUnresolved).not.toHaveBeenCalled();
+
+    const { error: deleteError } = await supabase
+      .from("llm_call_events")
+      .delete()
+      .eq("id", result.id);
+    expect(deleteError).toBeNull();
+  });
+
+  it("stores a null cost and alerts for an unresolved model, then cleans up", async () => {
+    const supabase = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+    );
+    const alertPriceUnresolved = vi.fn(async () => undefined);
+    const deps = {
+      ...createSupabaseEventWriteDeps(supabase),
+      alertPriceUnresolved,
+    };
+
+    const result = await writeLlmCallEvent(deps, {
+      projectId: process.env.TEST_PROJECT_ID as string,
+      provider: "anthropic",
+      model: "volar-live-test-unreleased-model",
+      inputTokens: 10,
+      outputTokens: 10,
+      occurredAt: "2026-08-20T00:00:00Z",
+      status: "success",
+    });
+
+    expect(result.costUsd).toBeNull();
+    expect(alertPriceUnresolved).toHaveBeenCalledTimes(1);
 
     const { error: deleteError } = await supabase
       .from("llm_call_events")

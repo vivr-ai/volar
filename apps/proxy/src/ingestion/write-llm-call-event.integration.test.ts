@@ -66,6 +66,7 @@ beforeEach(() => {
       insertedRows.push(row);
       return { id: `row-${insertedRows.length}` };
     },
+    alertPriceUnresolved: async () => undefined,
   };
 });
 
