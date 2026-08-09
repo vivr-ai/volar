@@ -56,6 +56,20 @@ end-to-end before real app code exists.
 
 ## Status
 
-Tracking `Volar_V1_Backlog.xlsx` / `Volar_V1_Engineering_Execution_Plan.md`,
-Epic 1 (Repo & Infra Scaffolding), issue 1.1. See that plan for the full
-135-issue V1 backlog and milestone sequencing.
+Tracking `Volar_V1_Backlog.xlsx` / `Volar_V1_Engineering_Execution_Plan.md`
+(135 issues across 24 epics). See `docs/WORKING_AGREEMENT.md` for how
+this backlog gets worked (one issue at a time, full verification, full
+commit set per issue) — read that first if you're a fresh chat/session
+picking this up.
+
+**Completed:** Epics 1–5 (issues 1.1–1.10, 2.1–2.5, 3.1–3.4, 4.1–4.5,
+5.1–5.5) — repo/infra scaffolding, auth & account foundations, core data
+model (Organization/User/Project/APIKey/Tags), PriceTable & deterministic
+cost engine, and LLMCallEvent ingestion (schema, cost-computed write
+path, null-cost alerting, idempotency, reconciliation fixtures).
+
+**Next up:** Epic 6 (Ingestion API), issue 6.1 — `POST /v1/events`
+endpoint scaffold on `apps/proxy`.
+
+Per-area technical decisions and verification history: `docs/RLS.md`,
+`docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.
