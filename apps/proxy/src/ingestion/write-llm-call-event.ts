@@ -2,15 +2,17 @@ import { computeCostUsd, resolvePriceForEvent, type PriceTableRow } from "@volar
 
 // Issue 5.2 (Epic 5): server-side event-write function.
 // Issue 5.3 (Epic 5): null-cost handling + internal alert stub.
+// Issue 5.4 (Epic 5): idempotency -- dedupe by client-generated event_id.
 //
 // Takes an already-validated incoming event payload (validation itself
 // is issue 6.3's job -- this function assumes its input is well-formed)
-// and performs the three steps every ingested event needs: resolve the
+// and performs the steps every ingested event needs: resolve the
 // PriceTable version in effect at the time of the call (issue 4.4),
 // compute the cost from it (issue 4.3), and produce the exact row to
-// insert into llm_call_events (issue 5.1's schema).
+// insert into llm_call_events (issue 5.1's schema, extended by 5.4 with
+// event_id).
 //
-// Deliberately takes its I/O as three injected async functions
+// Deliberately takes its I/O as injected async functions
 // (WriteLlmCallEventDeps) rather than a Supabase client directly, for
 // the same reason 4.4's resolvePriceForEvent takes an already-fetched
 // row array instead of querying itself: it keeps this function
@@ -19,26 +21,31 @@ import { computeCostUsd, resolvePriceForEvent, type PriceTableRow } from "@volar
 // adapter that both the future HTTP endpoint (issue 6.1) and the queue
 // worker (issue 7.3) can share.
 //
-// AC1 ("insert always carries a computed_cost_usd or explicit null,
-// never a silently wrong number"): if no PriceTable row resolves for
-// this provider/model/occurred_at, costUsd is null and the row is still
-// inserted -- the write must never fail or guess just because pricing
-// data is missing.
+// Issue 5.4: `payload.eventId` is the SDK's client-generated idempotency
+// key, resent unchanged on every retry of the same real LLM call.
+// `deps.insertEvent` is expected to perform an insert-or-ignore against
+// the DB's `unique(event_id)` constraint (AC2 -- enforced at the DB
+// level, not just here) and report back whether this call actually
+// inserted a new row or hit an existing one (`wasDuplicate`). Either
+// way, writeLlmCallEvent returns the row's *actual, stored* id/cost --
+// never a second row, never a mismatched value on a retry (AC1).
 //
-// Issue 5.3 builds directly on that null-cost branch: whenever it's
-// taken, deps.alertPriceUnresolved is called so the team notices the
-// pricing gap (a log line for V1, per this issue's description --
-// swapping in real Sentry reporting later, issue 19.2, only means
-// changing which function is passed in here, not this file). The alert
-// is best-effort and never allowed to block or fail the write itself --
-// a broken alert channel is not a reason to lose an event's cost data,
-// so any error it throws is swallowed after the price-unresolved branch
-// has already decided costUsd is null.
+// Known, accepted limitation: if the very first attempt at an event
+// with an unresolvable price is retried, deps.alertPriceUnresolved
+// fires again on each retry (this function resolves price and may
+// alert *before* dedup is known, since dedup is only discovered at
+// insert time). This only risks a duplicate log line for an
+// already-flagged pricing gap -- it never duplicates a row or a cost --
+// and de-duplicating the alert itself was judged out of scope for this
+// issue's stated acceptance criteria.
 
 export type SupportedProvider = "openai" | "anthropic";
 export type EventStatus = "success" | "error";
 
 export interface ValidatedEventPayload {
+  /** Client-generated idempotency key (issue 5.4) -- the same real LLM
+   * call must always resend the same eventId on retry. */
+  eventId: string;
   projectId: string;
   provider: SupportedProvider;
   model: string;
@@ -50,8 +57,9 @@ export interface ValidatedEventPayload {
   status: EventStatus;
 }
 
-/** Exact shape of a row to insert into public.llm_call_events (issue 5.1). */
+/** Exact shape of a row to insert into public.llm_call_events (issue 5.1, +event_id from 5.4). */
 export interface LLMCallEventInsertRow {
+  event_id: string;
   project_id: string;
   provider: SupportedProvider;
   model: string;
@@ -72,6 +80,14 @@ export interface PriceUnresolvedAlert {
   occurredAt: string;
 }
 
+export interface InsertEventOutcome {
+  id: string;
+  costUsd: string | null;
+  /** True if this call hit an existing row via the event_id unique
+   * constraint rather than inserting a new one (issue 5.4). */
+  wasDuplicate: boolean;
+}
+
 export interface WriteLlmCallEventDeps {
   /** All PriceTable rows for this exact (provider, model) — the caller
    * decides how to fetch them; resolvePriceForEvent does the boundary
@@ -80,7 +96,10 @@ export interface WriteLlmCallEventDeps {
     provider: string,
     model: string,
   ) => Promise<readonly PriceTableRow[]>;
-  insertEvent: (row: LLMCallEventInsertRow) => Promise<{ id: string }>;
+  /** Must perform an insert-or-ignore keyed on event_id (issue 5.4) and
+   * return the row's real, stored id/cost whether freshly inserted or
+   * already present. */
+  insertEvent: (row: LLMCallEventInsertRow) => Promise<InsertEventOutcome>;
   /** Called (best-effort) whenever an event's price could not be
    * resolved, so the team notices the pricing gap (issue 5.3). Never
    * allowed to block or fail the write. */
@@ -92,6 +111,7 @@ export interface WriteLlmCallEventDeps {
 export interface WriteLlmCallEventResult {
   id: string;
   costUsd: string | null;
+  wasDuplicate: boolean;
 }
 
 export async function writeLlmCallEvent(
@@ -127,6 +147,7 @@ export async function writeLlmCallEvent(
   }
 
   const row: LLMCallEventInsertRow = {
+    event_id: payload.eventId,
     project_id: payload.projectId,
     provider: payload.provider,
     model: payload.model,
@@ -139,8 +160,11 @@ export async function writeLlmCallEvent(
     status: payload.status,
   };
 
-  const inserted = await deps.insertEvent(row);
-  return { id: inserted.id, costUsd };
+  const outcome = await deps.insertEvent(row);
+  // Always return the row's actual stored values, not the locally
+  // computed ones -- on a duplicate (issue 5.4), that's the original
+  // attempt's real cost, which is what the caller should see.
+  return { id: outcome.id, costUsd: outcome.costUsd, wasDuplicate: outcome.wasDuplicate };
 }
 
 function toIso(value: string | Date): string {

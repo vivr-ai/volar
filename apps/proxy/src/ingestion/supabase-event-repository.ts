@@ -1,14 +1,18 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { PriceTableRow } from "@volar/shared";
-import type { LLMCallEventInsertRow, WriteLlmCallEventDeps } from "./write-llm-call-event.js";
+import type {
+  InsertEventOutcome,
+  LLMCallEventInsertRow,
+  WriteLlmCallEventDeps,
+} from "./write-llm-call-event.js";
 
 // Real Supabase-backed wiring for writeLlmCallEvent's WriteLlmCallEventDeps
-// (issue 5.2). Thin and mechanical on purpose -- all actual logic lives
-// in write-llm-call-event.ts's pure orchestration function; this file
-// only translates that function's two DB-facing I/O calls into real
-// Supabase queries. Consumed by the future ingestion endpoint (issue
-// 6.1) and queue worker (issue 7.3), both of which need the same DB
-// wiring.
+// (issue 5.2, extended by issues 5.3/5.4). Thin and mechanical on
+// purpose -- all actual logic lives in write-llm-call-event.ts's pure
+// orchestration function; this file only translates that function's
+// DB-facing I/O calls into real Supabase queries. Consumed by the
+// future ingestion endpoint (issue 6.1) and queue worker (issue 7.3),
+// both of which need the same DB wiring.
 //
 // Requires a client authenticated with the service_role key -- RLS on
 // both price_table (issue 4.1) and llm_call_events (issue 5.1)
@@ -57,18 +61,41 @@ export function createSupabaseEventWriteDeps(
       }));
     },
 
-    async insertEvent(row: LLMCallEventInsertRow): Promise<{ id: string }> {
+    // Issue 5.4: insert-or-ignore keyed on the unique(event_id)
+    // constraint. `ignoreDuplicates: true` turns this into
+    // `INSERT ... ON CONFLICT (event_id) DO NOTHING` -- on a duplicate,
+    // PostgREST returns zero rows (not an error), so we fall back to
+    // selecting the already-stored row and report its real, canonical
+    // id/cost back to the caller rather than an empty result.
+    async insertEvent(row: LLMCallEventInsertRow): Promise<InsertEventOutcome> {
       const { data, error } = await supabase
         .from("llm_call_events")
-        .insert(row)
-        .select("id")
-        .single();
+        .upsert(row, { onConflict: "event_id", ignoreDuplicates: true })
+        .select("id, computed_cost_usd");
 
       if (error) {
         throw new Error(`Failed to insert llm_call_events row: ${error.message}`);
       }
 
-      return { id: (data as { id: string }).id };
+      if (data && data.length > 0) {
+        const inserted = data[0] as { id: string; computed_cost_usd: string | null };
+        return { id: inserted.id, costUsd: inserted.computed_cost_usd, wasDuplicate: false };
+      }
+
+      const { data: existing, error: fetchError } = await supabase
+        .from("llm_call_events")
+        .select("id, computed_cost_usd")
+        .eq("event_id", row.event_id)
+        .single();
+
+      if (fetchError) {
+        throw new Error(
+          `event_id conflicted but failed to fetch the existing row: ${fetchError.message}`,
+        );
+      }
+
+      const existingRow = existing as { id: string; computed_cost_usd: string | null };
+      return { id: existingRow.id, costUsd: existingRow.computed_cost_usd, wasDuplicate: true };
     },
   };
 }

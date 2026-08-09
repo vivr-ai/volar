@@ -271,3 +271,19 @@ table "llm_call_events"`, confirming writes are denied entirely for
 that role, not just filtered. `get_advisors` clean apart from the same
 pre-existing, unrelated Auth warning. Both disposable test rows were
 deleted after verification.
+
+### event_id dedupe column (issue 5.4)
+
+A follow-up migration added `event_id uuid not null unique` — a
+client-generated idempotency key (not part of PRD §7's original field
+list, same "elaboration required by the backlog" status as
+`price_table`), so an SDK's retried delivery of the same real LLM call
+never creates a second row or double-counts a future DailyCostRollup.
+Global uniqueness (not scoped per-project) is deliberate — see the
+migration file's comment for the reasoning. Verified directly: a plain
+duplicate `insert` fails with `duplicate key value violates unique
+constraint "llm_call_events_event_id_key"` (the DB-level backstop, AC2),
+while `insert ... on conflict (event_id) do nothing` — what the
+application code actually uses — silently no-ops, leaving exactly one
+row. `get_advisors` clean apart from the same pre-existing, unrelated
+Auth warning.

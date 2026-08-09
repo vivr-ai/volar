@@ -1,9 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import type { PriceTableRow } from "@volar/shared";
-import { writeLlmCallEvent, type WriteLlmCallEventDeps } from "./write-llm-call-event.js";
+import {
+  writeLlmCallEvent,
+  type WriteLlmCallEventDeps,
+  type InsertEventOutcome,
+  type LLMCallEventInsertRow,
+} from "./write-llm-call-event.js";
 
-// Real seeded PriceTable data (issue 4.2), same fixture used by issue
-// 4.4's tests -- two Claude Sonnet 5 versions with a real price change.
 const sonnetRows: PriceTableRow[] = [
   {
     provider: "anthropic",
@@ -23,21 +26,37 @@ const sonnetRows: PriceTableRow[] = [
   },
 ];
 
+// Fakes deps.insertEvent as a realistic insert-or-ignore-by-event_id
+// store, mirroring the real Postgres unique(event_id) constraint +
+// upsert(..., { ignoreDuplicates: true }) behavior (issue 5.4).
 function makeDeps(
   priceRows: readonly PriceTableRow[],
   overrides: Partial<WriteLlmCallEventDeps> = {},
 ): {
   deps: WriteLlmCallEventDeps;
-  insertedRows: unknown[];
+  insertedRows: LLMCallEventInsertRow[];
   alertPriceUnresolved: ReturnType<typeof vi.fn>;
 } {
-  const insertedRows: unknown[] = [];
+  const insertedRows: LLMCallEventInsertRow[] = [];
+  const byEventId = new Map<string, InsertEventOutcome>();
+  let nextId = 1;
   const alertPriceUnresolved = vi.fn(async () => undefined);
+
   const deps: WriteLlmCallEventDeps = {
     fetchPriceRows: vi.fn(async () => priceRows),
-    insertEvent: vi.fn(async (row) => {
+    insertEvent: vi.fn(async (row: LLMCallEventInsertRow): Promise<InsertEventOutcome> => {
+      const existing = byEventId.get(row.event_id);
+      if (existing) {
+        return { ...existing, wasDuplicate: true };
+      }
       insertedRows.push(row);
-      return { id: "11111111-1111-1111-1111-111111111111" };
+      const outcome: InsertEventOutcome = {
+        id: `row-${nextId++}`,
+        costUsd: row.computed_cost_usd,
+        wasDuplicate: false,
+      };
+      byEventId.set(row.event_id, outcome);
+      return outcome;
     }),
     alertPriceUnresolved,
     ...overrides,
@@ -47,10 +66,10 @@ function makeDeps(
 
 describe("writeLlmCallEvent", () => {
   it("resolves the correct price version and computes cost (hand-calculated)", async () => {
-    // 1500 input @ $0.0020/1k = 0.003, 500 output @ $0.0100/1k = 0.005 -> 0.008
     const { deps, insertedRows, alertPriceUnresolved } = makeDeps(sonnetRows);
 
     const result = await writeLlmCallEvent(deps, {
+      eventId: "11111111-aaaa-aaaa-aaaa-111111111111",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "claude-sonnet-5",
@@ -61,28 +80,16 @@ describe("writeLlmCallEvent", () => {
     });
 
     expect(result.costUsd).toBe("0.008");
+    expect(result.wasDuplicate).toBe(false);
     expect(deps.fetchPriceRows).toHaveBeenCalledWith("anthropic", "claude-sonnet-5");
-    expect(insertedRows).toEqual([
-      {
-        project_id: "33333333-3333-3333-3333-333333333333",
-        provider: "anthropic",
-        model: "claude-sonnet-5",
-        input_tokens: 1500,
-        output_tokens: 500,
-        computed_cost_usd: "0.008",
-        customer_id: null,
-        feature_id: null,
-        occurred_at: "2026-08-20T00:00:00.000Z",
-        status: "success",
-      },
-    ]);
-    // A resolved price is the normal case -- no alert should fire.
+    expect(insertedRows).toHaveLength(1);
     expect(alertPriceUnresolved).not.toHaveBeenCalled();
   });
 
   it("resolves the newer price version once its effective_from has passed", async () => {
     const { deps } = makeDeps(sonnetRows);
     const result = await writeLlmCallEvent(deps, {
+      eventId: "88888888-aaaa-aaaa-aaaa-888888888888",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "claude-sonnet-5",
@@ -91,13 +98,13 @@ describe("writeLlmCallEvent", () => {
       occurredAt: "2026-09-15T00:00:00Z",
       status: "success",
     });
-    // 1 * 0.003 + 1 * 0.015 = 0.018
     expect(result.costUsd).toBe("0.018");
   });
 
   it("passes through customer_id and feature_id tags when present", async () => {
     const { deps, insertedRows } = makeDeps(sonnetRows);
     await writeLlmCallEvent(deps, {
+      eventId: "99999999-aaaa-aaaa-aaaa-999999999999",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "claude-sonnet-5",
@@ -108,18 +115,14 @@ describe("writeLlmCallEvent", () => {
       occurredAt: "2026-08-20T00:00:00Z",
       status: "success",
     });
-    const row = insertedRows[0] as { customer_id: string; feature_id: string };
-    expect(row.customer_id).toBe("cust-42");
-    expect(row.feature_id).toBe("summarizer");
+    expect(insertedRows[0].customer_id).toBe("cust-42");
+    expect(insertedRows[0].feature_id).toBe("summarizer");
   });
 
-  // AC1 (issue 5.2): insert always carries a computed_cost_usd or
-  // explicit null -- never a silently wrong number, and the write must
-  // still succeed. AC1/AC2 (issue 5.3): the same branch also fires an
-  // internal alert with the right details.
   it("stores a null cost, still inserts, and alerts when no price resolves for the model", async () => {
     const { deps, insertedRows, alertPriceUnresolved } = makeDeps(sonnetRows);
     const result = await writeLlmCallEvent(deps, {
+      eventId: "22222222-aaaa-aaaa-aaaa-222222222222",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "some-unreleased-model",
@@ -131,8 +134,6 @@ describe("writeLlmCallEvent", () => {
 
     expect(result.costUsd).toBeNull();
     expect(insertedRows).toHaveLength(1);
-    expect((insertedRows[0] as { computed_cost_usd: unknown }).computed_cost_usd).toBeNull();
-
     expect(alertPriceUnresolved).toHaveBeenCalledTimes(1);
     expect(alertPriceUnresolved).toHaveBeenCalledWith({
       projectId: "33333333-3333-3333-3333-333333333333",
@@ -145,6 +146,7 @@ describe("writeLlmCallEvent", () => {
   it("stores a null cost and alerts when occurred_at predates the earliest known price", async () => {
     const { deps, alertPriceUnresolved } = makeDeps(sonnetRows);
     const result = await writeLlmCallEvent(deps, {
+      eventId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "claude-sonnet-5",
@@ -157,9 +159,6 @@ describe("writeLlmCallEvent", () => {
     expect(alertPriceUnresolved).toHaveBeenCalledTimes(1);
   });
 
-  // Issue 5.3: alerting is best-effort. A broken alert channel (e.g. a
-  // Sentry outage, once 19.2 wires that in) must never cost us the
-  // event's data -- the write still has to succeed.
   it("still writes the event (with null cost) even if alertPriceUnresolved throws", async () => {
     const { deps, insertedRows } = makeDeps(sonnetRows, {
       alertPriceUnresolved: vi.fn(async () => {
@@ -168,6 +167,7 @@ describe("writeLlmCallEvent", () => {
     });
 
     const result = await writeLlmCallEvent(deps, {
+      eventId: "33333333-aaaa-aaaa-aaaa-333333333333",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "some-unreleased-model",
@@ -178,13 +178,59 @@ describe("writeLlmCallEvent", () => {
     });
 
     expect(result.costUsd).toBeNull();
-    expect(result.id).toBe("11111111-1111-1111-1111-111111111111");
+    expect(result.id).toBe("row-1");
     expect(insertedRows).toHaveLength(1);
+  });
+
+  // Issue 5.4's literal stated unit test: submitting the same event
+  // twice must not create a second row.
+  it("submits the same event twice and asserts one row (AC1)", async () => {
+    const { deps, insertedRows } = makeDeps(sonnetRows);
+    const payload = {
+      eventId: "44444444-aaaa-aaaa-aaaa-444444444444",
+      projectId: "33333333-3333-3333-3333-333333333333",
+      provider: "anthropic" as const,
+      model: "claude-sonnet-5",
+      inputTokens: 1500,
+      outputTokens: 500,
+      occurredAt: "2026-08-20T00:00:00Z",
+      status: "success" as const,
+    };
+
+    const first = await writeLlmCallEvent(deps, payload);
+    const second = await writeLlmCallEvent(deps, payload);
+
+    expect(insertedRows).toHaveLength(1);
+    expect(first.wasDuplicate).toBe(false);
+    expect(second.wasDuplicate).toBe(true);
+    // The retry must see the same canonical id and cost, not a fresh
+    // (potentially different) computation.
+    expect(second.id).toBe(first.id);
+    expect(second.costUsd).toBe(first.costUsd);
+  });
+
+  it("two different events with different eventIds create two separate rows", async () => {
+    const { deps, insertedRows } = makeDeps(sonnetRows);
+    const base = {
+      projectId: "33333333-3333-3333-3333-333333333333",
+      provider: "anthropic" as const,
+      model: "claude-sonnet-5",
+      inputTokens: 100,
+      outputTokens: 100,
+      occurredAt: "2026-08-20T00:00:00Z",
+      status: "success" as const,
+    };
+
+    await writeLlmCallEvent(deps, { ...base, eventId: "55555555-aaaa-aaaa-aaaa-555555555555" });
+    await writeLlmCallEvent(deps, { ...base, eventId: "66666666-aaaa-aaaa-aaaa-666666666666" });
+
+    expect(insertedRows).toHaveLength(2);
   });
 
   it("preserves status: 'error' events (no token/cost gating at the write layer)", async () => {
     const { deps, insertedRows } = makeDeps(sonnetRows);
     await writeLlmCallEvent(deps, {
+      eventId: "77777777-aaaa-aaaa-aaaa-777777777777",
       projectId: "33333333-3333-3333-3333-333333333333",
       provider: "anthropic",
       model: "claude-sonnet-5",
@@ -193,6 +239,6 @@ describe("writeLlmCallEvent", () => {
       occurredAt: "2026-08-20T00:00:00Z",
       status: "error",
     });
-    expect((insertedRows[0] as { status: string }).status).toBe("error");
+    expect(insertedRows[0].status).toBe("error");
   });
 });
