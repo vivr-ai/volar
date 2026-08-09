@@ -55,6 +55,31 @@ but running a single package's script directly
 locally if `packages/shared/dist` doesn't exist yet — run `pnpm build`
 first, or use `pnpm exec turbo run test --filter=@volar/proxy` instead.
 
+## `node_modules` going stale relative to the workspace (found while closing issue 6.1)
+
+Symptom: `pnpm exec turbo run typecheck --filter=@volar/proxy` fails with
+`Cannot find module '@volar/shared'` / `Cannot find module
+'@supabase/supabase-js'` in files that weren't touched by the current
+change, even though `pnpm exec turbo run lint` on the same package just
+passed. Confirmed directly (not assumed): `packages/shared/dist/` was
+present and correctly built, but `apps/proxy/node_modules` had no
+`@volar/` or `@supabase/` entries at all — lint doesn't do module
+resolution (no type-aware rules configured in `packages/config/eslint/base.mjs`),
+so it can pass while typecheck, which does resolve real imports, fails.
+Turborepo's own `Unable to calculate transitive closures: Workspace
+'<pkg>' not found in lockfile` warning is a useful early sign of the same
+underlying staleness.
+
+Fix: `pnpm install` from the repo root, then re-run the failing
+`turbo run <task> --filter=<package>` command. This repo lives inside an
+OneDrive-synced folder; OneDrive is known to interfere with the
+symlinks/hardlinks pnpm's store relies on, which is a plausible
+contributor if this recurs (worth revisiting a non-synced repo location
+if it does). If a bare `pnpm install` reports "Already up to date" but
+the module-resolution errors persist, that points at sync-related
+corruption rather than a simple stale lockfile, and is worth flagging
+rather than repeatedly re-running install.
+
 ## The general rule going forward
 
 **Any script in a workspace package that consumes another workspace
