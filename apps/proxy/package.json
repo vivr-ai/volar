@@ -12,6 +12,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.2",
+    "@volar/shared": "workspace:*",
     "fastify": "^5.1.0"
   },
   "devDependencies": {
