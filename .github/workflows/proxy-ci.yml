@@ -38,11 +38,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Issue 5.5: routed through `turbo run ... --filter` rather than a
+      # bare `pnpm --filter @volar/proxy <script>`. apps/proxy started
+      # depending on @volar/shared's compiled output in issue 5.2
+      # ("main": "dist/index.js"), and a bare pnpm --filter call skips
+      # Turborepo's dependency graph entirely -- dist/ never gets built,
+      # so proxy's own test/typecheck/lint steps would fail with
+      # "Cannot find package '@volar/shared'". `turbo run <task>
+      # --filter=@volar/proxy` honors turbo.json's `dependsOn: ["^build"]`
+      # and builds @volar/shared first automatically. See docs/CI.md.
       - name: Lint
-        run: pnpm --filter @volar/proxy lint
+        run: pnpm exec turbo run lint --filter=@volar/proxy
 
       - name: Typecheck
-        run: pnpm --filter @volar/proxy typecheck
+        run: pnpm exec turbo run typecheck --filter=@volar/proxy
 
       - name: Test
-        run: pnpm --filter @volar/proxy test
+        run: pnpm exec turbo run test --filter=@volar/proxy

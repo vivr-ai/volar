@@ -39,11 +39,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Issue 5.5: routed through `turbo run ... --filter` rather than a
+      # bare `pnpm --filter @volar/dashboard <script>`, so that if/when
+      # apps/dashboard starts consuming @volar/shared's compiled output
+      # (the same way apps/proxy did in issue 5.2), Turborepo's
+      # `dependsOn: ["^build"]` builds it first automatically instead of
+      # this workflow silently skipping that step. See docs/CI.md.
       - name: Lint
-        run: pnpm --filter @volar/dashboard lint
+        run: pnpm exec turbo run lint --filter=@volar/dashboard
 
       - name: Typecheck
-        run: pnpm --filter @volar/dashboard typecheck
+        run: pnpm exec turbo run typecheck --filter=@volar/dashboard
 
       - name: Test
-        run: pnpm --filter @volar/dashboard test
+        run: pnpm exec turbo run test --filter=@volar/dashboard

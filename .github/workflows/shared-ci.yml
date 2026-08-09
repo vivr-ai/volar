@@ -1,0 +1,52 @@
+name: Shared CI
+
+# Issue 5.5: closes a real gap found while satisfying this issue's AC2
+# ("suite runs in CI on every PR touching 4.3/4.4/5.2"). dashboard-ci.yml
+# and proxy-ci.yml (issues 1.5/1.6) both already trigger on
+# packages/shared/** changes, but they only ever run *their own* app's
+# test script -- packages/shared's own test suite (compute-cost.test.ts,
+# resolve-price.test.ts, api-key.test.ts, and this issue's reconciliation
+# fixtures) has never actually been asserted by CI on its own. This
+# workflow closes that gap directly, mirroring dashboard-ci.yml/
+# proxy-ci.yml's shape. See docs/CI.md for the full writeup.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "packages/shared/**"
+      - ".github/workflows/shared-ci.yml"
+
+concurrency:
+  group: shared-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm exec turbo run lint --filter=@volar/shared
+
+      - name: Typecheck
+        run: pnpm exec turbo run typecheck --filter=@volar/shared
+
+      - name: Test
+        run: pnpm exec turbo run test --filter=@volar/shared
