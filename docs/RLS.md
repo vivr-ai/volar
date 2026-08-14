@@ -160,6 +160,31 @@ not a DB constraint — the 24-hour rotation grace period (US-5.1 AC2)
 requires the old and new key to both validate simultaneously for a day,
 which a strict "one non-revoked key" uniqueness constraint would break.
 
+### Auth middleware verification (issue 6.2)
+
+`apps/proxy`'s API-key auth middleware (`authenticateApiKey` /
+`evaluateApiKeyCandidates` in `src/auth/authenticate-api-key.ts`) has its
+own fixture-driven unit tests, but per this project's testing discipline
+its DB-facing adapter (`src/auth/supabase-api-key-repository.ts`) was
+also verified directly against this live project rather than assumed
+correct from the unit tests alone. Six disposable rows were seeded under
+the existing "RLS Test Project A" (`33333333-...`), covering every
+branch: an active key, a revoked key, an old key rotated <24h ago
+(should still authenticate), and an old key rotated >24h ago (should
+not). The repository's exact two queries (`select ... where key_prefix
+= $1`, then `select ... where rotated_from_key_id in (...)`) were run
+directly, and the results were fed through the same decision logic used
+in production (Node, not just reasoned about) — all six produced the
+expected outcome, including the two cases proving AC4 (a totally unknown
+prefix and a known prefix with the wrong secret both return the exact
+same `not_found` outcome — no distinguishable signal for a prober).
+`get_advisors` came back clean apart from the same pre-existing,
+unrelated Auth warning noted throughout this doc. All six disposable
+rows were deleted after verification. A negative check (`authenticated`
+selecting `hashed_key`) was re-run too, reconfirming issue 3.2's
+column-privilege restriction still holds — `permission denied for table
+api_keys`, unchanged.
+
 ## Customer & Feature Tags (issue 3.4)
 
 `public.customer_tags` and `public.feature_tags` are lookup tables

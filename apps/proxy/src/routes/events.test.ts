@@ -1,6 +1,8 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { hashApiKey, deriveKeyPrefixFromFullKey } from "@volar/shared";
 import { buildApp } from "../app.js";
+import type { ApiKeyCandidate, AuthenticateApiKeyDeps } from "../auth/authenticate-api-key.js";
 
 const SAMPLE_PAYLOAD = {
   eventId: "11111111-aaaa-aaaa-aaaa-111111111111",
@@ -13,12 +15,54 @@ const SAMPLE_PAYLOAD = {
   status: "success",
 };
 
+const VALID_KEY = "vlr_live_validtestkey00000000000000000000000";
+
 /**
- * Captures every line Fastify's pino logger writes, so tests can assert
- * on the *actual* structured log output (AC3) rather than guessing at
- * pino's internal child-logger method binding. Each captured line is a
- * JSON string; parseLines() below turns them back into objects.
+ * In-memory fake for AuthenticateApiKeyDeps, keyed by prefix exactly
+ * like the real Supabase adapter's query -- lets these route-level
+ * tests exercise the real authenticateApiKey() orchestration (issue
+ * 6.2) end-to-end without any DB. The pure grace-period/revocation
+ * decision logic itself has its own dedicated fixture tests in
+ * ../auth/authenticate-api-key.test.ts; this file only needs enough
+ * cases to prove the HTTP layer wires auth in correctly.
  */
+function makeAuthDeps(candidates: readonly ApiKeyCandidate[]): AuthenticateApiKeyDeps {
+  const byPrefix = new Map<string, ApiKeyCandidate[]>();
+  for (const candidate of candidates) {
+    // Re-derive each candidate's prefix from a fixture-only convention:
+    // tests below always build candidates via candidateFor(), which
+    // stashes the originating full key on the object for this purpose.
+    const prefix = (candidate as ApiKeyCandidate & { __fullKey: string }).__fullKey;
+    const derived = deriveKeyPrefixFromFullKey(prefix);
+    if (!derived) continue;
+    const bucket = byPrefix.get(derived) ?? [];
+    bucket.push(candidate);
+    byPrefix.set(derived, bucket);
+  }
+  return {
+    fetchCandidatesByPrefix: async (keyPrefix) => byPrefix.get(keyPrefix) ?? [],
+  };
+}
+
+function candidateFor(
+  fullKey: string,
+  overrides: Partial<Omit<ApiKeyCandidate, "hashedKey">> = {},
+): ApiKeyCandidate & { __fullKey: string } {
+  return {
+    id: "key-1",
+    projectId: "33333333-3333-3333-3333-333333333333",
+    hashedKey: hashApiKey(fullKey),
+    revokedAt: null,
+    supersededByCreatedAt: null,
+    ...overrides,
+    __fullKey: fullKey,
+  };
+}
+
+function buildTestApp(candidates: readonly ApiKeyCandidate[] = [candidateFor(VALID_KEY)]) {
+  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates) } });
+}
+
 function makeLogCapture(): { stream: Writable; lines: string[] } {
   const lines: string[] = [];
   const stream = new Writable({
@@ -38,14 +82,15 @@ function parseLines(lines: string[]): Record<string, unknown>[] {
 }
 
 describe("POST /v1/events", () => {
-  // AC1: "Endpoint exists at POST /v1/events and returns 202 on a
-  // well-formed request (stubbed auth for now)".
-  it("returns 202 with an accepted status on a well-formed request", async () => {
-    const app = buildApp();
+  // AC1 (issue 6.1) + AC1 (issue 6.2 -- "Valid current key authenticates
+  // successfully"): a well-formed request with a valid key returns 202.
+  it("returns 202 with an accepted status when the API key is valid", async () => {
+    const app = buildTestApp();
 
     const response = await app.inject({
       method: "POST",
       url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
       payload: SAMPLE_PAYLOAD,
     });
 
@@ -54,54 +99,134 @@ describe("POST /v1/events", () => {
     expect(response.json()).toEqual({ status: "accepted" });
   });
 
-  // AC1's "(stubbed auth for now)": real auth is issue 6.2. Until then, a
-  // request with no API key header at all must still succeed -- if this
-  // test starts failing once 6.2 lands, that's expected and correct
-  // (6.2 will replace it with positive/negative auth-case tests).
-  it("does not enforce any auth yet -- a request with no API key header still succeeds", async () => {
-    const app = buildApp();
+  // Issue 6.2 replaces 6.1's "auth stubbed" behavior -- a request with
+  // no API key header must now be rejected.
+  it("rejects a request with no x-api-key header at all", async () => {
+    const app = buildTestApp();
 
     const response = await app.inject({
       method: "POST",
       url: "/v1/events",
       payload: SAMPLE_PAYLOAD,
-      headers: {},
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "missing API key" });
+  });
+
+  // AC4: "Unknown key rejected without leaking whether the prefix exists"
+  it("rejects an unrecognized key with a generic error", async () => {
+    const app = buildTestApp();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "x-api-key": "vlr_live_totallyunknownkey0000000000000000" },
+      payload: SAMPLE_PAYLOAD,
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "invalid API key" });
+  });
+
+  it("rejects the right prefix with the wrong secret using the exact same generic error", async () => {
+    const app = buildTestApp([candidateFor(VALID_KEY)]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "x-api-key": "vlr_live_validtestkey99999999999999999999999" },
+      payload: SAMPLE_PAYLOAD,
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "invalid API key" });
+  });
+
+  // AC3: "Revoked key is rejected immediately with a clear error"
+  it("rejects a revoked key with a specific message", async () => {
+    const app = buildTestApp([
+      candidateFor(VALID_KEY, { revokedAt: "2026-08-01T00:00:00.000Z" }),
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
+      payload: SAMPLE_PAYLOAD,
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "this API key has been revoked" });
+  });
+
+  // AC2: "Key within its rotation grace period still authenticates"
+  it("authenticates an old key rotated less than 24h ago", async () => {
+    const recentSuccessor = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const app = buildTestApp([
+      candidateFor(VALID_KEY, { supersededByCreatedAt: recentSuccessor }),
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
+      payload: SAMPLE_PAYLOAD,
     });
 
     expect(response.statusCode).toBe(202);
   });
 
-  // AC2: "Endpoint responds within the latency budget (PRD NFR §10.2)
-  // even under a stub implementation". NFR §10.2's real budget (50ms p95
-  // / 150ms p99) is measured against a customer's live LLM call over a
-  // real network in issue 7.5's load test -- that's the actual
-  // verification of this NFR. This is a much looser in-process smoke
-  // check: with no auth/validation/DB/queue work in the path yet, the
-  // stub handler should be near-instant, so a generous bound here just
-  // catches an accidental blocking call creeping into the scaffold
-  // without being flaky in CI.
-  it("responds near-instantly as a stub (smoke check against the NFR §10.2 budget)", async () => {
-    const app = buildApp();
+  it("rejects an old key once its grace period has expired", async () => {
+    const staleSuccessor = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    const app = buildTestApp([
+      candidateFor(VALID_KEY, { supersededByCreatedAt: staleSuccessor }),
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
+      payload: SAMPLE_PAYLOAD,
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({
+      error: "this API key's rotation grace period has expired; use your current key",
+    });
+  });
+
+  // AC2 (issue 6.1): "Endpoint responds within the latency budget...
+  // even under a stub implementation". Real auth now sits in the path,
+  // but this deps fake is still in-memory (no real network/DB), so the
+  // same generous smoke bound still applies -- the real NFR §10.2
+  // measurement is issue 7.5's load test.
+  it("responds near-instantly even with real auth in the path (smoke check)", async () => {
+    const app = buildTestApp();
     const start = performance.now();
 
     await app.inject({
       method: "POST",
       url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
       payload: SAMPLE_PAYLOAD,
     });
 
-    const elapsedMs = performance.now() - start;
-    expect(elapsedMs).toBeLessThan(200);
+    expect(performance.now() - start).toBeLessThan(200);
   });
 
-  // AC3: "Basic request logging in place".
+  // AC3 (issue 6.1): "Basic request logging in place"
   it("logs a structured line identifying the accepted request", async () => {
     const { stream, lines } = makeLogCapture();
-    const app = buildApp({ logger: { level: "info", stream } });
+    const app = buildApp(
+      { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]) } },
+      { logger: { level: "info", stream } },
+    );
 
     await app.inject({
       method: "POST",
       url: "/v1/events",
+      headers: { "x-api-key": VALID_KEY },
       payload: SAMPLE_PAYLOAD,
     });
     await app.close(); // flush pino's stream before reading it back
@@ -113,5 +238,6 @@ describe("POST /v1/events", () => {
     expect(ingestionLog?.method).toBe("POST");
     expect(ingestionLog?.url).toBe("/v1/events");
     expect(ingestionLog?.msg).toBe("POST /v1/events accepted");
+    expect(ingestionLog?.projectId).toBe("33333333-3333-3333-3333-333333333333");
   });
 });

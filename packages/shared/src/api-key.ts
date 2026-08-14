@@ -84,3 +84,28 @@ export function verifyApiKey(
 function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
+
+/**
+ * Issue 6.2 (Epic 6): derives the same `keyPrefix` string generateApiKey()
+ * produces, but from a *presented* full key at verification time rather
+ * than at issuance time. This is what lets the auth middleware do an
+ * indexed `key_prefix` lookup (candidate rows, typically 0 or 1) instead
+ * of fetching and hashing against every row in `api_keys` on every
+ * request -- `key_prefix` exists in the schema specifically "for
+ * display/lookup" (see the issue 3.2 migration's column comment).
+ *
+ * Returns null for anything that isn't even shaped like a Volar key
+ * (wrong/missing prefix, or too short to contain a real prefix segment)
+ * -- callers use that to short-circuit straight to a generic
+ * "not found" auth failure without touching the database at all.
+ */
+export function deriveKeyPrefixFromFullKey(fullKey: string): string | null {
+  if (!fullKey.startsWith(KEY_PREFIX)) {
+    return null;
+  }
+  const secret = fullKey.slice(KEY_PREFIX.length);
+  if (secret.length < PREFIX_DISPLAY_CHARS) {
+    return null;
+  }
+  return `${KEY_PREFIX}${secret.slice(0, PREFIX_DISPLAY_CHARS)}`;
+}

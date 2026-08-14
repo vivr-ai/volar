@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { generateApiKey, hashApiKey, verifyApiKey } from "./api-key.js";
+import {
+  generateApiKey,
+  hashApiKey,
+  verifyApiKey,
+  deriveKeyPrefixFromFullKey,
+} from "./api-key.js";
 
 describe("api-key", () => {
   it("generates a key with the stable vlr_live_ prefix", () => {
@@ -40,5 +45,24 @@ describe("api-key", () => {
     // but both still verify correctly against the same original key
     expect(verifyApiKey(fullKey, hash1)).toBe(true);
     expect(verifyApiKey(fullKey, hash2)).toBe(true);
+  });
+
+  describe("deriveKeyPrefixFromFullKey", () => {
+    it("derives the exact same prefix generateApiKey() issued", () => {
+      const { fullKey, keyPrefix } = generateApiKey();
+      expect(deriveKeyPrefixFromFullKey(fullKey)).toBe(keyPrefix);
+    });
+
+    it("returns null for a key with the wrong prefix", () => {
+      expect(deriveKeyPrefixFromFullKey("sk_live_notavolarkey")).toBeNull();
+    });
+
+    it("returns null for a key too short to contain a real prefix segment", () => {
+      expect(deriveKeyPrefixFromFullKey("vlr_live_abc")).toBeNull();
+    });
+
+    it("returns null for a completely empty string", () => {
+      expect(deriveKeyPrefixFromFullKey("")).toBeNull();
+    });
   });
 });
