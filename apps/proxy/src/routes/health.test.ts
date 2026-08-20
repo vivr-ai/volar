@@ -1,16 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { buildApp } from "../app.js";
+import { createInMemoryRateLimitStore, DEFAULT_INGESTION_RATE_LIMIT_CONFIG } from "../rate-limit/rate-limiter.js";
 
 // Issue 6.2: buildApp() now requires an events-route deps object (real
 // API-key auth needs a real dependency). /health doesn't touch auth at
 // all, so an empty stub that would blow up if ever called is enough --
 // this test never exercises it.
+// Issue 6.5: same reasoning for rateLimit -- /health never reaches the
+// events route's preHandlers, so a real (harmless, unused) store is
+// enough; no need for a throwing stub since nothing about rate-limit
+// deps can be "called unexpectedly" the way an auth DB lookup can.
 const testDeps = {
   events: {
     authApiKeyDeps: {
       fetchCandidatesByPrefix: async () => {
         throw new Error("unexpected auth check during a /health test");
       },
+    },
+    rateLimit: {
+      store: createInMemoryRateLimitStore(),
+      config: DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
     },
   },
 };

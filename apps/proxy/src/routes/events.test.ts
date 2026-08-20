@@ -3,6 +3,12 @@ import { describe, expect, it } from "vitest";
 import { hashApiKey, deriveKeyPrefixFromFullKey } from "@volar/shared";
 import { buildApp } from "../app.js";
 import type { ApiKeyCandidate, AuthenticateApiKeyDeps } from "../auth/authenticate-api-key.js";
+import {
+  createInMemoryRateLimitStore,
+  DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
+  type RateLimitConfig,
+} from "../rate-limit/rate-limiter.js";
+import type { EventsRouteDeps } from "./events.js";
 
 // Issue 6.3: this is the real wire shape (ingestionEventPayloadSchema,
 // snake_case per FR-6.5) -- deliberately does NOT include project_id
@@ -62,8 +68,24 @@ function candidateFor(
   };
 }
 
-function buildTestApp(candidates: readonly ApiKeyCandidate[] = [candidateFor(VALID_KEY)]) {
-  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates) } });
+/**
+ * Fresh in-memory rate-limit deps, defaulting to the real production
+ * threshold (DEFAULT_INGESTION_RATE_LIMIT_CONFIG) so ordinary tests --
+ * which fire at most a handful of requests each -- implicitly prove
+ * normal traffic never trips it, using the actual shipped number
+ * rather than a redefined test-only copy. A fresh store per call means
+ * no cross-test pollution even though buildTestApp() is called many
+ * times across this file.
+ */
+function defaultRateLimitDeps(config: RateLimitConfig = DEFAULT_INGESTION_RATE_LIMIT_CONFIG): EventsRouteDeps["rateLimit"] {
+  return { store: createInMemoryRateLimitStore(), config };
+}
+
+function buildTestApp(
+  candidates: readonly ApiKeyCandidate[] = [candidateFor(VALID_KEY)],
+  rateLimit: EventsRouteDeps["rateLimit"] = defaultRateLimitDeps(),
+) {
+  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates), rateLimit } });
 }
 
 function makeLogCapture(): { stream: Writable; lines: string[] } {
@@ -233,7 +255,7 @@ describe("POST /v1/events", () => {
   it("logs a structured line identifying the accepted request", async () => {
     const { stream, lines } = makeLogCapture();
     const app = buildApp(
-      { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]) } },
+      { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
       { logger: { level: "info", stream } },
     );
 
@@ -370,7 +392,7 @@ describe("POST /v1/events", () => {
     it("ignores a client-supplied project_id in the body entirely", async () => {
       const { stream, lines } = makeLogCapture();
       const app = buildApp(
-        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]) } },
+        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
         { logger: { level: "info", stream } },
       );
 
@@ -516,7 +538,7 @@ describe("POST /v1/events", () => {
     it("logs a summary line with correct accepted/rejected counts for a batch", async () => {
       const { stream, lines } = makeLogCapture();
       const app = buildApp(
-        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]) } },
+        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
         { logger: { level: "info", stream } },
       );
 
@@ -540,6 +562,165 @@ describe("POST /v1/events", () => {
       expect(ingestionLog?.rejected).toBe(1);
       expect(rejectedLog).toBeDefined();
       expect(rejectedLog?.rejectedCount).toBe(1);
+    });
+  });
+
+  // Issue 6.5: per-API-key rate limiting. Most tests below use a
+  // deliberately tiny limit (2/min) rather than the real 300/min
+  // default -- firing 300+ sequential .inject() calls per test would
+  // work but is needlessly slow; a tiny, explicit limit exercises the
+  // exact same checkRateLimit() code path (already unit-tested against
+  // the real default's numbers in rate-limiter.test.ts) deterministically
+  // and fast. The real default is still exercised implicitly by every
+  // *other* test in this file, none of which come close to tripping it.
+  describe("rate limiting (issue 6.5)", () => {
+    const TINY_LIMIT: RateLimitConfig = { limit: 2, windowMs: 60_000 };
+
+    // AC1: "Requests beyond the configured threshold receive a 429
+    // with a Retry-After header."
+    it("returns 429 with a Retry-After header once a key exceeds its limit", async () => {
+      const app = buildTestApp([candidateFor(VALID_KEY)], defaultRateLimitDeps(TINY_LIMIT));
+
+      for (let i = 0; i < TINY_LIMIT.limit; i++) {
+        const ok = await app.inject({
+          method: "POST",
+          url: "/v1/events",
+          headers: { "x-api-key": VALID_KEY },
+          payload: SAMPLE_PAYLOAD,
+        });
+        expect(ok.statusCode).toBe(202);
+      }
+
+      const blocked = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.headers["retry-after"]).toBeDefined();
+      expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
+      expect(blocked.json().error).toBe("rate limit exceeded, please slow down");
+    });
+
+    // AC2: "Rate limit is per API key, not global."
+    it("tracks separate budgets per API key, not a shared/global one", async () => {
+      const OTHER_KEY = "vlr_live_othertestkey000000000000000000000000";
+      const app = buildTestApp(
+        [
+          candidateFor(VALID_KEY, { id: "key-1" }),
+          candidateFor(OTHER_KEY, { id: "key-2" }),
+        ],
+        defaultRateLimitDeps(TINY_LIMIT),
+      );
+
+      // Exhaust VALID_KEY's budget.
+      for (let i = 0; i < TINY_LIMIT.limit; i++) {
+        await app.inject({
+          method: "POST",
+          url: "/v1/events",
+          headers: { "x-api-key": VALID_KEY },
+          payload: SAMPLE_PAYLOAD,
+        });
+      }
+      const validKeyBlocked = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      expect(validKeyBlocked.statusCode).toBe(429);
+
+      // OTHER_KEY has never been charged -- still has its full budget,
+      // proving the limit isn't a single global counter.
+      const otherKeyStillOk = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": OTHER_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      expect(otherKeyStillOk.statusCode).toBe(202);
+    });
+
+    // Auth must still run first: an unauthenticated request should
+    // never consume (or be evaluated against) any key's rate-limit
+    // budget -- see makeRateLimitPreHandler's comment in events.ts.
+    it("does not consume rate-limit budget for a request that fails auth", async () => {
+      const app = buildTestApp([candidateFor(VALID_KEY)], defaultRateLimitDeps(TINY_LIMIT));
+
+      // Fire more than the tiny limit's worth of *unauthenticated*
+      // requests -- if these were (wrongly) charged against some
+      // shared bucket, a subsequent authenticated request could be
+      // incorrectly blocked.
+      for (let i = 0; i < TINY_LIMIT.limit + 3; i++) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/events",
+          payload: SAMPLE_PAYLOAD,
+        });
+        expect(response.statusCode).toBe(401);
+      }
+
+      const authenticated = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      expect(authenticated.statusCode).toBe(202);
+    });
+
+    // AC3 (documented threshold): a smoke check that the real,
+    // shipped default (300/min) does not interfere with ordinary
+    // traffic -- a handful of requests, well under the threshold, all
+    // succeed.
+    it("does not interfere with ordinary traffic under the real default threshold", async () => {
+      const app = buildTestApp(); // real DEFAULT_INGESTION_RATE_LIMIT_CONFIG
+
+      for (let i = 0; i < 5; i++) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/events",
+          headers: { "x-api-key": VALID_KEY },
+          payload: SAMPLE_PAYLOAD,
+        });
+        expect(response.statusCode).toBe(202);
+      }
+    });
+
+    it("logs a structured warning when a request is rate-limited", async () => {
+      const { stream, lines } = makeLogCapture();
+      const app = buildApp(
+        {
+          events: {
+            authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
+            rateLimit: defaultRateLimitDeps(TINY_LIMIT),
+          },
+        },
+        { logger: { level: "info", stream } },
+      );
+
+      for (let i = 0; i < TINY_LIMIT.limit; i++) {
+        await app.inject({
+          method: "POST",
+          url: "/v1/events",
+          headers: { "x-api-key": VALID_KEY },
+          payload: SAMPLE_PAYLOAD,
+        });
+      }
+      await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      await app.close();
+
+      const entries = parseLines(lines);
+      const rateLimitLog = entries.find((entry) => entry.event === "rate_limit_exceeded");
+      expect(rateLimitLog).toBeDefined();
+      expect(rateLimitLog?.apiKeyId).toBe("key-1");
     });
   });
 });

@@ -9,6 +9,7 @@ import {
   type ApiKeyAuthResult,
   type AuthenticateApiKeyDeps,
 } from "../auth/authenticate-api-key.js";
+import { checkRateLimit, type RateLimitConfig, type RateLimitStore } from "../rate-limit/rate-limiter.js";
 import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js";
 
 // Issue 6.1 (Epic 6 -- Ingestion API): POST /v1/events endpoint scaffold.
@@ -16,6 +17,8 @@ import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js
 // Issue 6.3: real payload validation.
 // Issue 6.4: batch support (this file's main handler, not a preHandler
 // -- see below for why).
+// Issue 6.5: per-API-key rate limiting (a second preHandler, after
+// auth -- see makeRateLimitPreHandler below).
 //
 // Still deliberately incomplete beyond auth + validation -- no real
 // write yet: 6.5/7.2/7.3 change the handler body to actually
@@ -79,6 +82,19 @@ declare module "fastify" {
 
 export interface EventsRouteDeps {
   authApiKeyDeps: AuthenticateApiKeyDeps;
+  /**
+   * Issue 6.5: kept required (like authApiKeyDeps), not defaulted
+   * inside this module -- buildApp() already committed to "everything
+   * explicit, no hidden magic defaults" as of issue 6.2, specifically
+   * so a future real-server wiring can never silently fall back to a
+   * threshold nobody chose on purpose. index.ts wires
+   * createInMemoryRateLimitStore() + DEFAULT_INGESTION_RATE_LIMIT_CONFIG;
+   * tests wire their own store/config per case (most reuse the real
+   * default so ordinary test traffic is implicitly proven not to trip
+   * it; a few use a deliberately tiny limit to exercise AC1/AC2
+   * quickly -- see events.test.ts).
+   */
+  rateLimit: { store: RateLimitStore; config: RateLimitConfig };
 }
 
 function authFailureMessage(
@@ -133,6 +149,47 @@ function makeApiKeyAuthPreHandler(authDeps: AuthenticateApiKeyDeps) {
     }
 
     request.apiKeyContext = { apiKeyId: result.apiKeyId, projectId: result.projectId };
+  };
+}
+
+/**
+ * Issue 6.5. Registered as a *second* preHandler, after
+ * makeApiKeyAuthPreHandler -- Fastify runs an array of preHandlers in
+ * registration order, so `request.apiKeyContext` is always set by the
+ * time this one runs (the non-null assertion below is safe for the
+ * same reason the handler's own is, at the top of registerEventsRoute).
+ * That ordering is deliberate, not incidental: AC2 requires the limit
+ * to be "per API key", which means the rate limiter needs to know
+ * *which* key made the request -- information only auth can produce.
+ * Running rate-limit after auth also means an unauthenticated request
+ * (bad/missing key) is rejected with a cheap 401 before ever touching
+ * the rate-limit store, so a prober spamming garbage credentials can't
+ * burn through a real key's budget.
+ */
+function makeRateLimitPreHandler(deps: EventsRouteDeps["rateLimit"]) {
+  return async function rateLimitPreHandler(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> {
+    const apiKeyId = request.apiKeyContext!.apiKeyId;
+    const decision = checkRateLimit(deps.store, apiKeyId, Date.now(), deps.config);
+
+    if (!decision.allowed) {
+      request.log.warn(
+        { event: "rate_limit_exceeded", apiKeyId, retryAfterSeconds: decision.retryAfterSeconds },
+        "POST /v1/events rate limit exceeded",
+      );
+      // AC1: "429 with a Retry-After header" -- seconds until the
+      // current window resets (RFC 9110 permits either a delay-seconds
+      // integer or an HTTP-date for this header; seconds is simpler and
+      // is what every mainstream rate-limited API -- GitHub, Stripe,
+      // Anthropic's own Messages API -- actually sends).
+      await reply
+        .header("Retry-After", String(decision.retryAfterSeconds))
+        .status(429)
+        .send({ error: "rate limit exceeded, please slow down", retryAfterSeconds: decision.retryAfterSeconds });
+      return;
+    }
   };
 }
 
@@ -198,7 +255,12 @@ function validateItem(
 export function registerEventsRoute(app: FastifyInstance, deps: EventsRouteDeps): void {
   app.post(
     "/v1/events",
-    { preHandler: makeApiKeyAuthPreHandler(deps.authApiKeyDeps) },
+    {
+      preHandler: [
+        makeApiKeyAuthPreHandler(deps.authApiKeyDeps),
+        makeRateLimitPreHandler(deps.rateLimit),
+      ],
+    },
     async (request, reply) => {
       // Non-null assertion is safe: the preHandler above already
       // short-circuited with a 401 if auth didn't succeed.

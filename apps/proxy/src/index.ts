@@ -1,6 +1,10 @@
 import { buildApp } from "./app.js";
 import { createServiceRoleSupabaseClient } from "./ingestion/supabase-event-repository.js";
 import { createSupabaseApiKeyAuthDeps } from "./auth/supabase-api-key-repository.js";
+import {
+  createInMemoryRateLimitStore,
+  DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
+} from "./rate-limit/rate-limiter.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -14,8 +18,18 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 // first request.
 const supabase = createServiceRoleSupabaseClient();
 
+// Issue 6.5: rate-limit state is in-memory (see rate-limiter.ts's
+// header comment for why -- no shared store exists until Epic 7's
+// queue work lands), so it's constructed once here, for this
+// process's lifetime, exactly like the app itself.
 const app = buildApp({
-  events: { authApiKeyDeps: createSupabaseApiKeyAuthDeps(supabase) },
+  events: {
+    authApiKeyDeps: createSupabaseApiKeyAuthDeps(supabase),
+    rateLimit: {
+      store: createInMemoryRateLimitStore(),
+      config: DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
+    },
+  },
 });
 
 app
