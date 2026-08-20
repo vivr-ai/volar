@@ -253,7 +253,11 @@ describe("POST /v1/events", () => {
     expect(ingestionLog?.url).toBe("/v1/events");
     expect(ingestionLog?.msg).toBe("POST /v1/events accepted");
     expect(ingestionLog?.projectId).toBe("33333333-3333-3333-3333-333333333333");
-    expect(ingestionLog?.eventId).toBe("11111111-aaaa-aaaa-aaaa-111111111111");
+    // Issue 6.4: the summary log line reports counts (works uniformly
+    // for both a single request and a batch), not a single eventId.
+    expect(ingestionLog?.batch).toBe(false);
+    expect(ingestionLog?.accepted).toBe(1);
+    expect(ingestionLog?.rejected).toBe(0);
   });
 
   // Issue 6.3, AC1: "Malformed payloads rejected with a 400 and a clear
@@ -383,6 +387,159 @@ describe("POST /v1/events", () => {
       const ingestionLog = entries.find((entry) => entry.event === "ingestion_request_received");
       // The authenticated key's project, not the body's spoofed one.
       expect(ingestionLog?.projectId).toBe("33333333-3333-3333-3333-333333333333");
+    });
+  });
+
+  // Issue 6.4: batch support (FR-6.8's local-batching behavior).
+  describe("batch support (issue 6.4)", () => {
+    function eventPayload(eventId: string, overrides: Record<string, unknown> = {}) {
+      return { ...SAMPLE_PAYLOAD, event_id: eventId, ...overrides };
+    }
+
+    // AC1: "A batch of N events results in N rows ... not N separate
+    // HTTP round trips required from the SDK" -- the real DB write is a
+    // later issue (6.5/7.x), so what's verifiable here is the plumbing:
+    // one HTTP call carries N independently-tracked outcomes.
+    it("accepts a batch of 3 valid events as a single request, reporting all 3", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          eventPayload("11111111-aaaa-aaaa-aaaa-111111111111"),
+          eventPayload("22222222-aaaa-aaaa-aaaa-222222222222"),
+          eventPayload("33333333-aaaa-aaaa-aaaa-333333333333"),
+        ],
+      });
+
+      expect(response.statusCode).toBe(202);
+      const body = response.json();
+      expect(body.accepted).toBe(3);
+      expect(body.rejected).toBe(0);
+      expect(body.results).toEqual([
+        { index: 0, status: "accepted", eventId: "11111111-aaaa-aaaa-aaaa-111111111111" },
+        { index: 1, status: "accepted", eventId: "22222222-aaaa-aaaa-aaaa-222222222222" },
+        { index: 2, status: "accepted", eventId: "33333333-aaaa-aaaa-aaaa-333333333333" },
+      ]);
+    });
+
+    // AC2: "Partial-batch failure (one bad event in an otherwise valid
+    // batch) does not fail the whole batch — bad events are rejected
+    // individually and reported back."
+    it("accepts the whole batch (202) even when one of several events is malformed, reporting each outcome individually", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          eventPayload("11111111-aaaa-aaaa-aaaa-111111111111"),
+          eventPayload("22222222-aaaa-aaaa-aaaa-222222222222", { input_tokens: -5 }),
+          eventPayload("33333333-aaaa-aaaa-aaaa-333333333333"),
+        ],
+      });
+
+      // The whole-request status is still 202 -- one bad event never
+      // fails the batch (AC2), unlike the single-event path (6.3).
+      expect(response.statusCode).toBe(202);
+      const body = response.json();
+      expect(body.accepted).toBe(2);
+      expect(body.rejected).toBe(1);
+      expect(body.results[0]).toEqual({ index: 0, status: "accepted", eventId: "11111111-aaaa-aaaa-aaaa-111111111111" });
+      expect(body.results[1].status).toBe("rejected");
+      expect(body.results[1].index).toBe(1);
+      expect(body.results[1].fieldErrors.input_tokens).toBeDefined();
+      expect(body.results[2]).toEqual({ index: 2, status: "accepted", eventId: "33333333-aaaa-aaaa-aaaa-333333333333" });
+    });
+
+    it("still returns 202 with all-rejected results when every event in a batch is malformed", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          eventPayload("11111111-aaaa-aaaa-aaaa-111111111111", { provider: "cohere" }),
+          eventPayload("22222222-aaaa-aaaa-aaaa-222222222222", { input_tokens: -1 }),
+        ],
+      });
+
+      expect(response.statusCode).toBe(202);
+      const body = response.json();
+      expect(body.accepted).toBe(0);
+      expect(body.rejected).toBe(2);
+    });
+
+    it("accepts a single-element array (a batch of one)", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [eventPayload("11111111-aaaa-aaaa-aaaa-111111111111")],
+      });
+
+      expect(response.statusCode).toBe(202);
+      const body = response.json();
+      expect(body.accepted).toBe(1);
+      expect(body.results).toHaveLength(1);
+    });
+
+    // Judgment call documented in events.ts: an empty batch has nothing
+    // to process, so it's a top-level 400 rather than a vacuous
+    // "0 accepted, 0 rejected" 202.
+    it("rejects an empty batch array with 400", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [],
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual({ error: "batch must contain at least one event" });
+    });
+
+    it("still requires the same authenticated key for a batch request (auth applies once, to the whole request)", async () => {
+      const app = buildTestApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        payload: [eventPayload("11111111-aaaa-aaaa-aaaa-111111111111")],
+      });
+
+      expect(response.statusCode).toBe(401);
+    });
+
+    it("logs a summary line with correct accepted/rejected counts for a batch", async () => {
+      const { stream, lines } = makeLogCapture();
+      const app = buildApp(
+        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]) } },
+        { logger: { level: "info", stream } },
+      );
+
+      await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          eventPayload("11111111-aaaa-aaaa-aaaa-111111111111"),
+          eventPayload("22222222-aaaa-aaaa-aaaa-222222222222", { model: "" }),
+        ],
+      });
+      await app.close();
+
+      const entries = parseLines(lines);
+      const ingestionLog = entries.find((entry) => entry.event === "ingestion_request_received");
+      const rejectedLog = entries.find((entry) => entry.event === "payload_rejected");
+
+      expect(ingestionLog?.batch).toBe(true);
+      expect(ingestionLog?.accepted).toBe(1);
+      expect(ingestionLog?.rejected).toBe(1);
+      expect(rejectedLog).toBeDefined();
+      expect(rejectedLog?.rejectedCount).toBe(1);
     });
   });
 });

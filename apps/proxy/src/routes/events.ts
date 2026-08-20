@@ -13,14 +13,14 @@ import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js
 
 // Issue 6.1 (Epic 6 -- Ingestion API): POST /v1/events endpoint scaffold.
 // Issue 6.2: real API-key auth middleware.
-// Issue 6.3: real payload validation (this file's second preHandler).
+// Issue 6.3: real payload validation.
+// Issue 6.4: batch support (this file's main handler, not a preHandler
+// -- see below for why).
 //
 // Still deliberately incomplete beyond auth + validation -- no real
-// write yet:
-//   - 6.4 changes the handler to accept an array (batch) of events.
-//   - 6.5/7.2/7.3 change the handler body to actually enqueue/write the
-//     event via the 5.2 `writeLlmCallEvent` function, using
-//     request.validatedEvent below instead of re-deriving it.
+// write yet: 6.5/7.2/7.3 change the handler body to actually
+// enqueue/write events via the 5.2 `writeLlmCallEvent` function, using
+// request.validatedEvents below instead of re-deriving it.
 //
 // Header choice for issue 6.2: the PRD (FR-6.5) says the SDK sends "...
 // project API key" as one of the event fields but doesn't specify HTTP
@@ -32,6 +32,32 @@ import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js
 // familiar to Volar's own target developer. This is a judgment call on
 // a genuinely open point, flagged here rather than decided silently --
 // revisit if the SDK packages (Epic 9/10) want something else.
+//
+// Two judgment calls for issue 6.4, both flagged here per the Working
+// Agreement rather than decided silently:
+//
+// 1. Both a single event object AND an array of events are accepted.
+//    FR-6.8 describes the SDK as *always* batching locally before
+//    flushing (even a "batch" of one), so in production only the array
+//    form will ever really be sent -- but issue 6.3's existing
+//    single-object contract (and its tests/AC1's 400-on-invalid
+//    behavior) isn't superseded by anything in 6.4's stated ACs, which
+//    are explicitly about *batch* partial-failure handling. Keeping the
+//    single-object path exactly as 6.3 left it (still 400 on an invalid
+//    single payload, still `{status:"accepted"}` on a valid one) avoids
+//    silently changing already-shipped, already-tested behavior for no
+//    stated reason, while the array path gets the new
+//    always-202-with-per-item-results semantics AC2 asks for. Detected
+//    via `Array.isArray(request.body)`.
+// 2. Validation therefore moved out of a preHandler (issue 6.3's
+//    design) and into the main handler. A preHandler's job is
+//    "short-circuit reject or continue" -- that fits 6.3's all-or-
+//    nothing single payload, but not 6.4's AC2 ("partial-batch failure
+//    ... does not fail the whole batch"), which needs to inspect every
+//    item and build a per-item result set rather than stopping at the
+//    first bad one. Auth stays a preHandler (still genuinely all-or-
+//    nothing: one key authenticates the whole request, valid for every
+//    item in a batch).
 
 const API_KEY_HEADER = "x-api-key";
 
@@ -40,14 +66,14 @@ declare module "fastify" {
     /** Set by the auth preHandler once a request authenticates
      * successfully (issue 6.2). */
     apiKeyContext?: { apiKeyId: string; projectId: string };
-    /** Set by the payload-validation preHandler once the body parses
-     * against ingestionEventPayloadSchema (issue 6.3) -- already mapped
-     * to the exact shape write-llm-call-event.ts's writeLlmCallEvent()
-     * expects, including project_id resolved from apiKeyContext (never
-     * from the client body -- see the schema's own comment on why).
-     * Future issues (6.4 batch, 6.5/7.x real write) consume this
-     * directly instead of re-deriving it. */
-    validatedEvent?: ValidatedEventPayload;
+    /** Set by the handler once the body's been validated (issue 6.3,
+     * extended to arrays in 6.4) -- every successfully-validated event
+     * from the request, single or batch, in original order. Future
+     * issues (6.5/7.x real write) consume this directly instead of
+     * re-deriving it. Rejected items are *not* included here -- see
+     * the response body's `results` array (batch requests) or `error`
+     * field (single requests) for those. */
+    validatedEvents?: ValidatedEventPayload[];
   }
 }
 
@@ -137,68 +163,131 @@ function toValidatedEventPayload(
   };
 }
 
-/**
- * Issue 6.3, AC1/AC2/AC3. Always runs after the auth preHandler (see
- * the preHandler array order in registerEventsRoute below), so
- * request.apiKeyContext is guaranteed set by the time this runs --
- * auth would already have short-circuited the request with a 401
- * otherwise. Validating only after auth succeeds also means a stranger
- * probing the endpoint with garbage bodies and no valid key never gets
- * the (mildly more informative) validation-error path at all.
- */
-async function payloadValidationPreHandler(
-  request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<void> {
-  const parseResult = ingestionEventPayloadSchema.safeParse(request.body);
+type BatchItemResult =
+  | { index: number; status: "accepted"; eventId: string }
+  | {
+      index: number;
+      status: "rejected";
+      error: string;
+      fieldErrors: Record<string, string[] | undefined>;
+      formErrors: string[];
+    };
+
+function validateItem(
+  item: unknown,
+  index: number,
+  projectId: string,
+): { result: BatchItemResult; validated: ValidatedEventPayload | null } {
+  const parseResult = ingestionEventPayloadSchema.safeParse(item);
 
   if (!parseResult.success) {
     const { fieldErrors, formErrors } = flattenIngestionPayloadErrors(parseResult.error);
-    request.log.warn(
-      { event: "payload_rejected", fieldErrors, formErrors },
-      "POST /v1/events rejected a malformed payload",
-    );
-    // AC1: "Malformed payloads rejected with a 400 and a clear error
-    // body" -- fieldErrors names exactly which field(s) failed and why,
-    // rather than a single opaque message.
-    await reply.status(400).send({ error: "invalid event payload", fieldErrors, formErrors });
-    return;
+    return {
+      result: { index, status: "rejected", error: "invalid event payload", fieldErrors, formErrors },
+      validated: null,
+    };
   }
 
-  // Non-null assertion is safe: see this function's doc comment above.
-  const projectId = request.apiKeyContext!.projectId;
-  request.validatedEvent = toValidatedEventPayload(parseResult.data, projectId);
+  const validated = toValidatedEventPayload(parseResult.data, projectId);
+  return {
+    result: { index, status: "accepted", eventId: validated.eventId },
+    validated,
+  };
 }
 
 export function registerEventsRoute(app: FastifyInstance, deps: EventsRouteDeps): void {
   app.post(
     "/v1/events",
-    { preHandler: [makeApiKeyAuthPreHandler(deps.authApiKeyDeps), payloadValidationPreHandler] },
+    { preHandler: makeApiKeyAuthPreHandler(deps.authApiKeyDeps) },
     async (request, reply) => {
+      // Non-null assertion is safe: the preHandler above already
+      // short-circuited with a 401 if auth didn't succeed.
+      const projectId = request.apiKeyContext!.projectId;
+
+      const isBatch = Array.isArray(request.body);
+      const items: unknown[] = isBatch ? (request.body as unknown[]) : [request.body];
+
+      // Edge case not covered by either issue's literal ACs, so this is
+      // a judgment call: an explicitly-empty batch array (`[]`) has
+      // nothing to process at all -- treated as a top-level 400 rather
+      // than a vacuous "0 accepted, 0 rejected" 202, since the latter
+      // would silently succeed a request that did nothing.
+      if (isBatch && items.length === 0) {
+        await reply.status(400).send({ error: "batch must contain at least one event" });
+        return;
+      }
+
+      const validatedEvents: ValidatedEventPayload[] = [];
+      const results: BatchItemResult[] = items.map((item, index) => {
+        const { result, validated } = validateItem(item, index, projectId);
+        if (validated) validatedEvents.push(validated);
+        return result;
+      });
+
+      request.validatedEvents = validatedEvents;
+
+      const acceptedCount = validatedEvents.length;
+      const rejectedCount = results.length - acceptedCount;
+
       // AC3 (issue 6.1): basic request logging. Structured (not a bare
       // string) so it's greppable/queryable once real log aggregation
       // lands (Epic 19), and deliberately does not log the full request
       // body -- event payloads can carry customer-supplied metadata
       // (customer_id, feature_id) that shouldn't be duplicated into
       // logs beyond whatever Epic 19's observability work explicitly
-      // decides to capture. event_id is safe/useful to log (an opaque
-      // idempotency key, not customer data), so it's included here.
+      // decides to capture.
       request.log.info(
         {
           event: "ingestion_request_received",
           method: request.method,
           url: request.url,
-          projectId: request.apiKeyContext?.projectId,
-          eventId: request.validatedEvent?.eventId,
+          projectId,
+          batch: isBatch,
+          accepted: acceptedCount,
+          rejected: rejectedCount,
         },
         "POST /v1/events accepted",
       );
 
-      // AC2 (issue 6.3): "Valid payloads pass through unchanged" -- the
-      // response for a valid, authenticated request is unaffected by
-      // adding validation; still 202/accepted. The actual write is
-      // issue 6.5/7.x's job, using request.validatedEvent.
-      return reply.status(202).send({ status: "accepted" });
+      // AC1 (issue 6.3) / AC2 (issue 6.4): rejected item(s) always get a
+      // clear, structured record -- a single summary log line covering
+      // every rejected item in this request, rather than one line per
+      // item (bounded by batch size in practice -- SDKs flush every
+      // 2-5s per FR-6.8, not thousands of events at once -- but no
+      // reason to spam the log stream per-item regardless).
+      if (rejectedCount > 0) {
+        request.log.warn(
+          {
+            event: "payload_rejected",
+            batch: isBatch,
+            rejectedCount,
+            rejected: results.filter((r) => r.status === "rejected"),
+          },
+          isBatch
+            ? "POST /v1/events rejected some events in the batch"
+            : "POST /v1/events rejected a malformed payload",
+        );
+      }
+
+      if (!isBatch) {
+        // Unchanged from issue 6.3: a single request's one-and-only
+        // event is all-or-nothing at the HTTP level.
+        const only = results[0];
+        if (only.status === "rejected") {
+          return reply
+            .status(400)
+            .send({ error: only.error, fieldErrors: only.fieldErrors, formErrors: only.formErrors });
+        }
+        return reply.status(202).send({ status: "accepted" });
+      }
+
+      // AC2 (issue 6.4): "Partial-batch failure ... does not fail the
+      // whole batch — bad events are rejected individually and reported
+      // back." A batch request always reaches this 202 (the empty-array
+      // case above is the only rejected batch shape), carrying each
+      // item's own accepted/rejected outcome rather than collapsing the
+      // whole request to a single pass/fail.
+      return reply.status(202).send({ accepted: acceptedCount, rejected: rejectedCount, results });
     },
   );
 }

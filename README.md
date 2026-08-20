@@ -67,13 +67,13 @@ picking this up.
 model (Organization/User/Project/APIKey/Tags), PriceTable & deterministic
 cost engine, and LLMCallEvent ingestion (schema, cost-computed write
 path, null-cost alerting, idempotency, reconciliation fixtures). Epic 6
-issues 6.1–6.3 — `POST /v1/events` endpoint scaffold, real API-key auth
-middleware (hash lookup, 24h rotation grace period, revocation), and
-request payload validation (shared zod schema per PRD FR-6.5) on
-`apps/proxy`.
+issues 6.1–6.4 — `POST /v1/events` endpoint scaffold, real API-key auth
+middleware (hash lookup, 24h rotation grace period, revocation), request
+payload validation (shared zod schema per PRD FR-6.5), and batch support
+(array of events per FR-6.8, partial-failure-tolerant) on `apps/proxy`.
 
-**Next up:** Epic 6 (Ingestion API), issue 6.4 — batch endpoint support
-(accept an array of events per FR-6.8) on `apps/proxy`.
+**Next up:** Epic 6 (Ingestion API), issue 6.5 — rate limiting / abuse
+protection (per-API-key) on `apps/proxy`.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.
