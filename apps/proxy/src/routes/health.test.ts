@@ -10,12 +10,17 @@ import { createInMemoryRateLimitStore, DEFAULT_INGESTION_RATE_LIMIT_CONFIG } fro
 // events route's preHandlers, so a real (harmless, unused) store is
 // enough; no need for a throwing stub since nothing about rate-limit
 // deps can be "called unexpectedly" the way an auth DB lookup can.
+// Issue 6.6: touchLastUsedAt gets the same throwing-stub treatment as
+// authApiKeyDeps -- /health should never reach it either.
 const testDeps = {
   events: {
     authApiKeyDeps: {
       fetchCandidatesByPrefix: async () => {
         throw new Error("unexpected auth check during a /health test");
       },
+    },
+    touchLastUsedAt: async () => {
+      throw new Error("unexpected last_used_at touch during a /health test");
     },
     rateLimit: {
       store: createInMemoryRateLimitStore(),

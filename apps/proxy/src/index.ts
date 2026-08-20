@@ -1,6 +1,9 @@
 import { buildApp } from "./app.js";
 import { createServiceRoleSupabaseClient } from "./ingestion/supabase-event-repository.js";
-import { createSupabaseApiKeyAuthDeps } from "./auth/supabase-api-key-repository.js";
+import {
+  createSupabaseApiKeyAuthDeps,
+  createTouchApiKeyLastUsedAt,
+} from "./auth/supabase-api-key-repository.js";
 import {
   createInMemoryRateLimitStore,
   DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
@@ -25,6 +28,7 @@ const supabase = createServiceRoleSupabaseClient();
 const app = buildApp({
   events: {
     authApiKeyDeps: createSupabaseApiKeyAuthDeps(supabase),
+    touchLastUsedAt: createTouchApiKeyLastUsedAt(supabase),
     rateLimit: {
       store: createInMemoryRateLimitStore(),
       config: DEFAULT_INGESTION_RATE_LIMIT_CONFIG,

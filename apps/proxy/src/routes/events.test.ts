@@ -81,11 +81,33 @@ function defaultRateLimitDeps(config: RateLimitConfig = DEFAULT_INGESTION_RATE_L
   return { store: createInMemoryRateLimitStore(), config };
 }
 
+/**
+ * Records every apiKeyId touchLastUsedAt was called with, resolving
+ * immediately by default. Tests that only care about the *shape* of
+ * the request (most of this file) don't need to construct one --
+ * buildTestApp() defaults to a plain no-op recorder-less stub; tests
+ * in the "last_used_at update (issue 6.6)" describe block build their
+ * own so they can assert on `calls`.
+ */
+function makeTouchLastUsedAtRecorder(
+  impl: (apiKeyId: string) => Promise<void> = async () => {},
+): { touchLastUsedAt: EventsRouteDeps["touchLastUsedAt"]; calls: string[] } {
+  const calls: string[] = [];
+  return {
+    touchLastUsedAt: async (apiKeyId: string) => {
+      calls.push(apiKeyId);
+      return impl(apiKeyId);
+    },
+    calls,
+  };
+}
+
 function buildTestApp(
   candidates: readonly ApiKeyCandidate[] = [candidateFor(VALID_KEY)],
   rateLimit: EventsRouteDeps["rateLimit"] = defaultRateLimitDeps(),
+  touchLastUsedAt: EventsRouteDeps["touchLastUsedAt"] = async () => {},
 ) {
-  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates), rateLimit } });
+  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates), rateLimit, touchLastUsedAt } });
 }
 
 function makeLogCapture(): { stream: Writable; lines: string[] } {
@@ -255,7 +277,13 @@ describe("POST /v1/events", () => {
   it("logs a structured line identifying the accepted request", async () => {
     const { stream, lines } = makeLogCapture();
     const app = buildApp(
-      { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
+      {
+        events: {
+          authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
+          rateLimit: defaultRateLimitDeps(),
+          touchLastUsedAt: async () => {},
+        },
+      },
       { logger: { level: "info", stream } },
     );
 
@@ -392,7 +420,13 @@ describe("POST /v1/events", () => {
     it("ignores a client-supplied project_id in the body entirely", async () => {
       const { stream, lines } = makeLogCapture();
       const app = buildApp(
-        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
+        {
+          events: {
+            authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
+            rateLimit: defaultRateLimitDeps(),
+            touchLastUsedAt: async () => {},
+          },
+        },
         { logger: { level: "info", stream } },
       );
 
@@ -538,7 +572,13 @@ describe("POST /v1/events", () => {
     it("logs a summary line with correct accepted/rejected counts for a batch", async () => {
       const { stream, lines } = makeLogCapture();
       const app = buildApp(
-        { events: { authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]), rateLimit: defaultRateLimitDeps() } },
+        {
+          events: {
+            authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
+            rateLimit: defaultRateLimitDeps(),
+            touchLastUsedAt: async () => {},
+          },
+        },
         { logger: { level: "info", stream } },
       );
 
@@ -696,6 +736,7 @@ describe("POST /v1/events", () => {
           events: {
             authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
             rateLimit: defaultRateLimitDeps(TINY_LIMIT),
+            touchLastUsedAt: async () => {},
           },
         },
         { logger: { level: "info", stream } },
@@ -721,6 +762,121 @@ describe("POST /v1/events", () => {
       const rateLimitLog = entries.find((entry) => entry.event === "rate_limit_exceeded");
       expect(rateLimitLog).toBeDefined();
       expect(rateLimitLog?.apiKeyId).toBe("key-1");
+    });
+  });
+
+  // Issue 6.6: fire-and-forget api_keys.last_used_at update on
+  // successful auth. The real DB write itself is verified live against
+  // Supabase (see docs/RLS.md) -- these tests only cover the HTTP
+  // layer's responsibility: calling touchLastUsedAt with the right
+  // apiKeyId exactly when auth succeeds, and never letting it affect
+  // the response either way (AC1: no added latency; AC2: never fails
+  // the request).
+  describe("last_used_at update (issue 6.6)", () => {
+    it("calls touchLastUsedAt with the authenticated key's id on successful auth", async () => {
+      const recorder = makeTouchLastUsedAtRecorder();
+      const app = buildTestApp([candidateFor(VALID_KEY, { id: "key-1" })], undefined, recorder.touchLastUsedAt);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(recorder.calls).toEqual(["key-1"]);
+    });
+
+    it("does not call touchLastUsedAt when auth fails", async () => {
+      const recorder = makeTouchLastUsedAtRecorder();
+      const app = buildTestApp([candidateFor(VALID_KEY)], undefined, recorder.touchLastUsedAt);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": "vlr_live_totallyunknownkey0000000000000000" },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(recorder.calls).toEqual([]);
+    });
+
+    // AC1: "without adding meaningful latency to the request path" --
+    // proven directly, not just asserted: touchLastUsedAt here never
+    // resolves at all, and the request still completes almost
+    // instantly. If the implementation ever accidentally awaited this
+    // call, this test would hang and fail on Vitest's default timeout
+    // rather than silently pass.
+    it("does not wait for touchLastUsedAt to resolve before responding", async () => {
+      const neverResolves = () => new Promise<void>(() => {});
+      const app = buildTestApp([candidateFor(VALID_KEY)], undefined, neverResolves);
+
+      const start = performance.now();
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(performance.now() - start).toBeLessThan(200);
+    });
+
+    // AC2: "a failure to update last_used_at never fails the ingestion
+    // request" -- a rejected touchLastUsedAt must not turn a would-be
+    // 202 into an error response.
+    it("still returns 202 even when touchLastUsedAt rejects", async () => {
+      const alwaysRejects = async () => {
+        throw new Error("simulated DB failure");
+      };
+      const app = buildTestApp([candidateFor(VALID_KEY)], undefined, alwaysRejects);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(202);
+    });
+
+    it("logs a structured warning (without failing the request) when touchLastUsedAt rejects", async () => {
+      const { stream, lines } = makeLogCapture();
+      const alwaysRejects = async () => {
+        throw new Error("simulated DB failure");
+      };
+      const app = buildApp(
+        {
+          events: {
+            authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY, { id: "key-1" })]),
+            rateLimit: defaultRateLimitDeps(),
+            touchLastUsedAt: alwaysRejects,
+          },
+        },
+        { logger: { level: "info", stream } },
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      // The rejection is async (fires after the response is already
+      // being sent) -- give the swallowed .catch() a tick to run before
+      // asserting on the captured log and closing the app.
+      await new Promise((resolve) => setImmediate(resolve));
+      await app.close();
+
+      expect(response.statusCode).toBe(202);
+      const entries = parseLines(lines);
+      const failureLog = entries.find((entry) => entry.event === "last_used_at_update_failed");
+      expect(failureLog).toBeDefined();
+      expect(failureLog?.apiKeyId).toBe("key-1");
     });
   });
 });

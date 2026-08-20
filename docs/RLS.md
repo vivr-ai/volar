@@ -185,6 +185,24 @@ selecting `hashed_key`) was re-run too, reconfirming issue 3.2's
 column-privilege restriction still holds — `permission denied for table
 api_keys`, unchanged.
 
+### last_used_at update verification (issue 6.6)
+
+`api_keys.last_used_at` (nullable `timestamptz`, no default) already
+existed in the issue 3.2 migration — this issue only added the write
+path, so verification focused on confirming the exact UPDATE the new
+adapter (`createTouchApiKeyLastUsedAt` in
+`src/auth/supabase-api-key-repository.ts`) runs actually works under
+`service_role`, since `public.api_keys` only has a `SELECT` RLS policy
+("Users can select own organization api keys") — no `UPDATE` policy
+exists for `authenticated`/`anon` at all. Seeded one disposable row
+under Project A (`33333333-...`, id `66666666-...-666666660601`) with
+`last_used_at` explicitly `null`; ran `update api_keys set
+last_used_at = now() where id = $1` (the same statement the adapter
+issues); confirmed the column changed from `null` to a real timestamp;
+deleted the row. `service_role` bypasses RLS entirely regardless of the
+missing `UPDATE` policy for `public` — same behavior already
+established and re-confirmed for every other write in this file.
+
 ## Customer & Feature Tags (issue 3.4)
 
 `public.customer_tags` and `public.feature_tags` are lookup tables

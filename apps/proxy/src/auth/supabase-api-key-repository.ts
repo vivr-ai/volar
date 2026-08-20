@@ -88,3 +88,40 @@ export function createSupabaseApiKeyAuthDeps(
     },
   };
 }
+
+/**
+ * Issue 6.6: real Supabase-backed wiring for the fire-and-forget
+ * last_used_at update -- a separate function from
+ * createSupabaseApiKeyAuthDeps() (not folded into it) because the two
+ * capabilities are consumed differently: fetchCandidatesByPrefix is
+ * called synchronously, on the request's critical path, by
+ * authenticateApiKey(); this is called by events.ts's preHandler
+ * *without being awaited*, specifically so a slow or failed write here
+ * can never add latency to (AC1) or fail (AC2) the actual request. Kept
+ * in this file rather than events.ts because "how do I write to
+ * api_keys" is this file's established job (same layering as
+ * fetchCandidatesByPrefix above) -- "when/whether to call it, and
+ * making sure it can't block the response" is the route layer's job,
+ * exactly like issue 6.5's rate-limit deps.
+ *
+ * Verified directly against the live Supabase project while closing
+ * this issue: seeded a disposable api_keys row with last_used_at null,
+ * ran this exact UPDATE, confirmed last_used_at became non-null, then
+ * deleted the row. service_role bypasses RLS entirely (same as every
+ * other write in this file), so the table's read-only "Users can
+ * select own organization api keys" policy has no bearing here.
+ */
+export function createTouchApiKeyLastUsedAt(
+  supabase: SupabaseClient,
+): (apiKeyId: string) => Promise<void> {
+  return async function touchApiKeyLastUsedAt(apiKeyId: string): Promise<void> {
+    const { error } = await supabase
+      .from("api_keys")
+      .update({ last_used_at: new Date().toISOString() })
+      .eq("id", apiKeyId);
+
+    if (error) {
+      throw new Error(`Failed to update api_keys.last_used_at: ${error.message}`);
+    }
+  };
+}

@@ -19,6 +19,9 @@ import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js
 // -- see below for why).
 // Issue 6.5: per-API-key rate limiting (a second preHandler, after
 // auth -- see makeRateLimitPreHandler below).
+// Issue 6.6: fire-and-forget api_keys.last_used_at update on
+// successful auth -- see the touchLastUsedAt call inside
+// makeApiKeyAuthPreHandler below.
 //
 // Still deliberately incomplete beyond auth + validation -- no real
 // write yet: 6.5/7.2/7.3 change the handler body to actually
@@ -95,6 +98,17 @@ export interface EventsRouteDeps {
    * quickly -- see events.test.ts).
    */
   rateLimit: { store: RateLimitStore; config: RateLimitConfig };
+  /**
+   * Issue 6.6: fires on every successful auth, never awaited on the
+   * request path (AC1: "without adding meaningful latency"), and any
+   * rejection is caught and merely logged, never allowed to fail the
+   * request (AC2: "a failure to update last_used_at never fails the
+   * ingestion request"). Kept required, same "no hidden defaults"
+   * reasoning as authApiKeyDeps/rateLimit above. index.ts wires
+   * createTouchApiKeyLastUsedAt(supabase); tests wire an in-memory
+   * fake that records calls.
+   */
+  touchLastUsedAt: (apiKeyId: string) => Promise<void>;
 }
 
 function authFailureMessage(
@@ -120,7 +134,10 @@ function authFailureMessage(
   }
 }
 
-function makeApiKeyAuthPreHandler(authDeps: AuthenticateApiKeyDeps) {
+function makeApiKeyAuthPreHandler(
+  authDeps: AuthenticateApiKeyDeps,
+  touchLastUsedAt: EventsRouteDeps["touchLastUsedAt"],
+) {
   return async function apiKeyAuthPreHandler(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -149,6 +166,21 @@ function makeApiKeyAuthPreHandler(authDeps: AuthenticateApiKeyDeps) {
     }
 
     request.apiKeyContext = { apiKeyId: result.apiKeyId, projectId: result.projectId };
+
+    // Issue 6.6, AC1/AC2: deliberately *not* awaited -- the request
+    // continues immediately regardless of how long this write takes or
+    // whether it succeeds at all. `void` makes the "intentionally
+    // fire-and-forget" explicit to both the reader and the linter
+    // (an un-awaited Promise would otherwise be an easy-to-miss bug
+    // elsewhere in this codebase). Any failure is caught and logged
+    // here -- the only place in this call path with a request logger
+    // in scope -- and never allowed to propagate.
+    void touchLastUsedAt(result.apiKeyId).catch((err: unknown) => {
+      request.log.warn(
+        { event: "last_used_at_update_failed", apiKeyId: result.apiKeyId, err },
+        "POST /v1/events failed to update api_keys.last_used_at (non-fatal)",
+      );
+    });
   };
 }
 
@@ -257,7 +289,7 @@ export function registerEventsRoute(app: FastifyInstance, deps: EventsRouteDeps)
     "/v1/events",
     {
       preHandler: [
-        makeApiKeyAuthPreHandler(deps.authApiKeyDeps),
+        makeApiKeyAuthPreHandler(deps.authApiKeyDeps, deps.touchLastUsedAt),
         makeRateLimitPreHandler(deps.rateLimit),
       ],
     },

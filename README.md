@@ -67,15 +67,18 @@ picking this up.
 model (Organization/User/Project/APIKey/Tags), PriceTable & deterministic
 cost engine, and LLMCallEvent ingestion (schema, cost-computed write
 path, null-cost alerting, idempotency, reconciliation fixtures). Epic 6
-issues 6.1–6.5 — `POST /v1/events` endpoint scaffold, real API-key auth
-middleware (hash lookup, 24h rotation grace period, revocation), request
-payload validation (shared zod schema per PRD FR-6.5), batch support
-(array of events per FR-6.8, partial-failure-tolerant), and per-API-key
-rate limiting (429 + Retry-After, in-memory fixed-window, documented
-300 req/min threshold) on `apps/proxy`.
+(Ingestion API), issues 6.1–6.6 — `POST /v1/events` endpoint scaffold,
+real API-key auth middleware (hash lookup, 24h rotation grace period,
+revocation), request payload validation (shared zod schema per PRD
+FR-6.5), batch support (array of events per FR-6.8, partial-failure-
+tolerant), per-API-key rate limiting (429 + Retry-After, in-memory
+fixed-window, documented 300 req/min threshold), and a fire-and-forget
+`api_keys.last_used_at` update on successful auth (PRD §10.3 key-
+activity visibility) on `apps/proxy`.
 
-**Next up:** Epic 6 (Ingestion API), issue 6.6 — `last_used_at` update
-on successful auth on `apps/proxy`.
+**Next up:** Epic 7 (Managed Queue), issue 7.1 — provision managed
+queue (Upstash Redis/QStash) for decoupling ingestion rate from write
+rate.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.
