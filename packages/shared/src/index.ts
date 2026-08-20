@@ -11,3 +11,9 @@ export { resolvePriceForEvent } from "./resolve-price.js";
 export type { PriceTableRow } from "./resolve-price.js";
 export { RECONCILIATION_FIXTURES, SEEDED_PRICE_TABLE } from "./reconciliation.fixtures.js";
 export type { ReconciliationFixture } from "./reconciliation.fixtures.js";
+export {
+  ingestionEventPayloadSchema,
+  SUPPORTED_INGESTION_PROVIDERS,
+  flattenIngestionPayloadErrors,
+} from "./ingestion-event-payload.js";
+export type { IngestionEventPayload } from "./ingestion-event-payload.js";

@@ -1,24 +1,26 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
+  ingestionEventPayloadSchema,
+  flattenIngestionPayloadErrors,
+  type IngestionEventPayload,
+} from "@volar/shared";
+import {
   authenticateApiKey,
   type ApiKeyAuthResult,
   type AuthenticateApiKeyDeps,
 } from "../auth/authenticate-api-key.js";
+import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js";
 
 // Issue 6.1 (Epic 6 -- Ingestion API): POST /v1/events endpoint scaffold.
-// Issue 6.2: real API-key auth middleware (this file's preHandler).
+// Issue 6.2: real API-key auth middleware.
+// Issue 6.3: real payload validation (this file's second preHandler).
 //
-// Still deliberately incomplete beyond auth -- no payload validation and
-// no real write yet:
-//   - 6.3 adds real payload validation (a zod schema per PRD FR-6.5,
-//     shared so SDK integration tests can assert against the same
-//     contract). Not attempted here -- a half-validation ad hoc check
-//     now would just be thrown away when 6.3 lands with the real schema
-//     and its own 400-with-clear-error-body AC.
+// Still deliberately incomplete beyond auth + validation -- no real
+// write yet:
 //   - 6.4 changes the handler to accept an array (batch) of events.
 //   - 6.5/7.2/7.3 change the handler body to actually enqueue/write the
-//     event via the 5.2 `writeLlmCallEvent` function instead of just
-//     logging and acking.
+//     event via the 5.2 `writeLlmCallEvent` function, using
+//     request.validatedEvent below instead of re-deriving it.
 //
 // Header choice for issue 6.2: the PRD (FR-6.5) says the SDK sends "...
 // project API key" as one of the event fields but doesn't specify HTTP
@@ -36,9 +38,16 @@ const API_KEY_HEADER = "x-api-key";
 declare module "fastify" {
   interface FastifyRequest {
     /** Set by the auth preHandler once a request authenticates
-     * successfully (issue 6.2). Future issues (6.4 batch, 6.5/7.x real
-     * write) read this instead of re-deriving project_id themselves. */
+     * successfully (issue 6.2). */
     apiKeyContext?: { apiKeyId: string; projectId: string };
+    /** Set by the payload-validation preHandler once the body parses
+     * against ingestionEventPayloadSchema (issue 6.3) -- already mapped
+     * to the exact shape write-llm-call-event.ts's writeLlmCallEvent()
+     * expects, including project_id resolved from apiKeyContext (never
+     * from the client body -- see the schema's own comment on why).
+     * Future issues (6.4 batch, 6.5/7.x real write) consume this
+     * directly instead of re-deriving it. */
+    validatedEvent?: ValidatedEventPayload;
   }
 }
 
@@ -51,19 +60,20 @@ function authFailureMessage(
 ): string {
   switch (reason) {
     case "revoked":
-      // AC3: "rejected immediately with a clear error". Safe to be
-      // specific here -- reaching this branch requires the presented
-      // key to have hash-matched a real row, i.e. the caller genuinely
-      // holds (or held) that exact secret. See the reason-field comment
-      // on ApiKeyAuthResult for the full argument.
+      // AC3 (issue 6.2): "rejected immediately with a clear error". Safe
+      // to be specific here -- reaching this branch requires the
+      // presented key to have hash-matched a real row, i.e. the caller
+      // genuinely holds (or held) that exact secret. See the
+      // reason-field comment on ApiKeyAuthResult for the full argument.
       return "this API key has been revoked";
     case "grace_period_expired":
       return "this API key's rotation grace period has expired; use your current key";
     case "not_found":
     default:
-      // AC4: deliberately generic -- covers both "no key with this
-      // prefix exists" and "prefix exists but the secret doesn't match"
-      // so a prober can't distinguish the two from the response.
+      // AC4 (issue 6.2): deliberately generic -- covers both "no key
+      // with this prefix exists" and "prefix exists but the secret
+      // doesn't match" so a prober can't distinguish the two from the
+      // response.
       return "invalid API key";
   }
 }
@@ -100,28 +110,94 @@ function makeApiKeyAuthPreHandler(authDeps: AuthenticateApiKeyDeps) {
   };
 }
 
+/**
+ * Maps the validated wire payload (snake_case, per FR-6.5) onto
+ * write-llm-call-event.ts's internal ValidatedEventPayload shape
+ * (camelCase), resolving project_id from the *authenticated key*
+ * (issue 6.2), never from the client body -- see
+ * ingestion-event-payload.ts's comment for why accepting a
+ * client-supplied project_id would be a cross-project write
+ * vulnerability.
+ */
+function toValidatedEventPayload(
+  payload: IngestionEventPayload,
+  projectId: string,
+): ValidatedEventPayload {
+  return {
+    eventId: payload.event_id,
+    projectId,
+    provider: payload.provider,
+    model: payload.model,
+    inputTokens: payload.input_tokens,
+    outputTokens: payload.output_tokens,
+    customerId: payload.customer_id ?? null,
+    featureId: payload.feature_id ?? null,
+    occurredAt: payload.timestamp,
+    status: payload.status,
+  };
+}
+
+/**
+ * Issue 6.3, AC1/AC2/AC3. Always runs after the auth preHandler (see
+ * the preHandler array order in registerEventsRoute below), so
+ * request.apiKeyContext is guaranteed set by the time this runs --
+ * auth would already have short-circuited the request with a 401
+ * otherwise. Validating only after auth succeeds also means a stranger
+ * probing the endpoint with garbage bodies and no valid key never gets
+ * the (mildly more informative) validation-error path at all.
+ */
+async function payloadValidationPreHandler(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  const parseResult = ingestionEventPayloadSchema.safeParse(request.body);
+
+  if (!parseResult.success) {
+    const { fieldErrors, formErrors } = flattenIngestionPayloadErrors(parseResult.error);
+    request.log.warn(
+      { event: "payload_rejected", fieldErrors, formErrors },
+      "POST /v1/events rejected a malformed payload",
+    );
+    // AC1: "Malformed payloads rejected with a 400 and a clear error
+    // body" -- fieldErrors names exactly which field(s) failed and why,
+    // rather than a single opaque message.
+    await reply.status(400).send({ error: "invalid event payload", fieldErrors, formErrors });
+    return;
+  }
+
+  // Non-null assertion is safe: see this function's doc comment above.
+  const projectId = request.apiKeyContext!.projectId;
+  request.validatedEvent = toValidatedEventPayload(parseResult.data, projectId);
+}
+
 export function registerEventsRoute(app: FastifyInstance, deps: EventsRouteDeps): void {
   app.post(
     "/v1/events",
-    { preHandler: makeApiKeyAuthPreHandler(deps.authApiKeyDeps) },
+    { preHandler: [makeApiKeyAuthPreHandler(deps.authApiKeyDeps), payloadValidationPreHandler] },
     async (request, reply) => {
       // AC3 (issue 6.1): basic request logging. Structured (not a bare
       // string) so it's greppable/queryable once real log aggregation
-      // lands (Epic 19), and deliberately does not log the request body
-      // -- event payloads can carry customer-supplied metadata
+      // lands (Epic 19), and deliberately does not log the full request
+      // body -- event payloads can carry customer-supplied metadata
       // (customer_id, feature_id) that shouldn't be duplicated into
       // logs beyond whatever Epic 19's observability work explicitly
-      // decides to capture.
+      // decides to capture. event_id is safe/useful to log (an opaque
+      // idempotency key, not customer data), so it's included here.
       request.log.info(
         {
           event: "ingestion_request_received",
           method: request.method,
           url: request.url,
           projectId: request.apiKeyContext?.projectId,
+          eventId: request.validatedEvent?.eventId,
         },
         "POST /v1/events accepted",
       );
 
+      // AC2 (issue 6.3): "Valid payloads pass through unchanged" -- the
+      // response for a valid, authenticated request is unaffected by
+      // adding validation; still 202/accepted. The actual write is
+      // issue 6.5/7.x's job, using request.validatedEvent.
       return reply.status(202).send({ status: "accepted" });
     },
   );
