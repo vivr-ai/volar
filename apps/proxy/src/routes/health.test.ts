@@ -12,6 +12,9 @@ import { createInMemoryRateLimitStore, DEFAULT_INGESTION_RATE_LIMIT_CONFIG } fro
 // deps can be "called unexpectedly" the way an auth DB lookup can.
 // Issue 6.6: touchLastUsedAt gets the same throwing-stub treatment as
 // authApiKeyDeps -- /health should never reach it either.
+// Issue 7.2: enqueueEvent gets the same throwing-stub treatment -- /health
+// never reaches the events route's handler at all, so this should never
+// be called.
 const testDeps = {
   events: {
     authApiKeyDeps: {
@@ -21,6 +24,9 @@ const testDeps = {
     },
     touchLastUsedAt: async () => {
       throw new Error("unexpected last_used_at touch during a /health test");
+    },
+    enqueueEvent: async () => {
+      throw new Error("unexpected enqueue during a /health test");
     },
     rateLimit: {
       store: createInMemoryRateLimitStore(),

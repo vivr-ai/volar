@@ -10,6 +10,7 @@ import {
   type AuthenticateApiKeyDeps,
 } from "../auth/authenticate-api-key.js";
 import { checkRateLimit, type RateLimitConfig, type RateLimitStore } from "../rate-limit/rate-limiter.js";
+import { enqueueValidatedEvents, type EnqueueOutcome } from "../ingestion/enqueue-event.js";
 import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js";
 
 // Issue 6.1 (Epic 6 -- Ingestion API): POST /v1/events endpoint scaffold.
@@ -22,11 +23,29 @@ import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js
 // Issue 6.6: fire-and-forget api_keys.last_used_at update on
 // successful auth -- see the touchLastUsedAt call inside
 // makeApiKeyAuthPreHandler below.
+// Issue 7.2: every validated event is durably enqueued (onto the
+// queue provisioned in issue 7.1) before the response is sent, rather
+// than written directly to Postgres -- see the enqueue step in the
+// main handler below, and enqueue-event.ts for the orchestration.
+// (7.3, not yet built, is what actually dequeues and calls the 5.2
+// `writeLlmCallEvent` function against each message.)
 //
-// Still deliberately incomplete beyond auth + validation -- no real
-// write yet: 6.5/7.2/7.3 change the handler body to actually
-// enqueue/write events via the 5.2 `writeLlmCallEvent` function, using
-// request.validatedEvents below instead of re-deriving it.
+// Judgment call for issue 7.2, flagged here per the Working Agreement:
+// an enqueue failure is NOT treated like a validation failure (6.3/
+// 6.4's per-item "rejected" outcome, still 202 overall). Validation
+// failures are the caller's fault -- retrying a malformed event never
+// helps, so reporting it and moving on is correct. Enqueue failures
+// are *our* infrastructure's fault -- exactly the transient case
+// FR-6.9's SDK-side "retry with backoff, then drop" exists for. So if
+// *any* validated event in a request fails to enqueue, the whole
+// request responds 503 (not a partial 202), telling the SDK's future
+// retry logic to resend the entire original batch. Re-sending
+// already-successfully-enqueued events this way is safe, not wasteful
+// double-work: issue 5.4's `event_id` uniqueness constraint (carried
+// through unchanged into the queued message, see enqueue-event.ts)
+// means 7.3's worker will silently no-op the duplicates when it
+// eventually inserts them, exactly as it already does for any other
+// retried delivery.
 //
 // Header choice for issue 6.2: the PRD (FR-6.5) says the SDK sends "...
 // project API key" as one of the event fields but doesn't specify HTTP
@@ -109,6 +128,19 @@ export interface EventsRouteDeps {
    * fake that records calls.
    */
   touchLastUsedAt: (apiKeyId: string) => Promise<void>;
+  /**
+   * Issue 7.2: durably enqueues one validated event (see
+   * enqueue-event.ts's EnqueueIngestionEventDeps -- same shape,
+   * re-declared here rather than imported so EventsRouteDeps stays a
+   * flat, self-contained list of capabilities like touchLastUsedAt
+   * above, not a grab-bag of other modules' dependency-object types).
+   * Unlike touchLastUsedAt, this one genuinely gates the response --
+   * see the main handler's comment for why enqueue failures can't be
+   * fire-and-forget the way 6.6's bookkeeping update is. index.ts
+   * wires createSupabaseEnqueueEvent(supabase); tests wire an
+   * in-memory fake.
+   */
+  enqueueEvent: (payload: ValidatedEventPayload) => Promise<{ msgId: number }>;
 }
 
 function authFailureMessage(
@@ -361,6 +393,40 @@ export function registerEventsRoute(app: FastifyInstance, deps: EventsRouteDeps)
             ? "POST /v1/events rejected some events in the batch"
             : "POST /v1/events rejected a malformed payload",
         );
+      }
+
+      // Issue 7.2, AC1: "Endpoint returns success once the event is
+      // durably enqueued, not once it's in Postgres." Deliberately
+      // awaited (unlike issue 6.6's touchLastUsedAt) -- unlike that
+      // best-effort bookkeeping update, a confirmed enqueue *is* the
+      // delivery guarantee this endpoint promises the caller, so the
+      // response cannot be sent before it's known to have happened.
+      // No-ops instantly for an empty `validatedEvents` (e.g. an
+      // all-rejected batch, or the single-request 400 path below) --
+      // nothing to enqueue, nothing to wait on.
+      const enqueueOutcomes: EnqueueOutcome[] = await enqueueValidatedEvents(
+        { enqueueEvent: deps.enqueueEvent },
+        validatedEvents,
+      );
+      const enqueueFailures = enqueueOutcomes.filter((outcome) => !outcome.enqueued);
+
+      if (enqueueFailures.length > 0) {
+        request.log.error(
+          {
+            event: "enqueue_failed",
+            batch: isBatch,
+            enqueueFailureCount: enqueueFailures.length,
+            failedEventIds: enqueueFailures.map((failure) => failure.eventId),
+          },
+          "POST /v1/events failed to durably enqueue one or more validated events",
+        );
+        // See this file's header comment for why this is a whole-
+        // request 503 rather than folding enqueue failures into the
+        // per-item `results` shape validation failures use.
+        return reply.status(503).send({
+          error: "failed to durably enqueue one or more events, please retry",
+          enqueueFailures: enqueueFailures.length,
+        });
       }
 
       if (!isBatch) {

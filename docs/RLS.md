@@ -369,3 +369,70 @@ Verified directly, in this order:
 
 `get_advisors` clean apart from the same pre-existing, unrelated Auth
 warning noted throughout this document.
+
+## Ingestion queue enqueue wrapper (issue 7.2)
+
+PostgREST (what `supabase-js`'s `.from()`/`.rpc()` calls actually talk
+to) only exposes the `public`/`graphql_public` schemas by default — the
+proxy's Supabase client has no direct way to call `pgmq.send()` in the
+`pgmq` schema issue 7.1 provisioned. Issue 7.2 adds a `SECURITY DEFINER`
+wrapper function, `public.enqueue_ingestion_event(payload jsonb)`, that
+calls `pgmq.send('ingestion_events', payload)` on the caller's behalf
+and returns the resulting `msg_id`. `SECURITY DEFINER` functions run
+with the *owner's* privileges regardless of caller — the standard,
+Supabase-documented pattern for reaching a non-`public` schema from
+PostgREST — but that also means the function's own grants are the only
+thing standing between `service_role` and every other role that can
+reach PostgREST at all, so this needed the same live-verified,
+not-assumed treatment as issue 7.1's schema grants.
+
+Verified directly, in this order:
+
+1. After the first migration (`create function
+   public.enqueue_ingestion_event(...)` + `revoke all ... from public;
+   grant execute ... to service_role;`): `set role service_role; select
+   public.enqueue_ingestion_event('{"eventId": "..."}'::jsonb);`
+   succeeded, returning a real `msg_id` (confirmed via `select * from
+   pgmq.q_ingestion_events` showing the message, then purged).
+2. Negative check, same migration state: `set role anon; select
+   public.enqueue_ingestion_event(...)` **succeeded** — msg_id 3 — when
+   it should have failed. A real gap, caught live before merge, not
+   assumed away. Root cause, confirmed via
+   `information_schema.role_routine_grants`: this Supabase project
+   carries a default-privilege rule (set at project creation, before any
+   of this project's own migrations) that grants `EXECUTE` on every new
+   `public`-schema function directly to `anon`/`authenticated`.
+   `revoke ... from public` only revokes the pseudo-role's own grant —
+   it does not touch a privilege granted directly to a *named* role, so
+   `anon`/`authenticated` kept their independent grant regardless. This
+   is the exact same class of gap this project already hit once for a
+   table's grants (see `fix_tag_upsert_grants`, issue 3.4's follow-up
+   migration) — now confirmed to apply to `public`-schema *functions*
+   too, not just tables.
+3. Follow-up migration: `revoke execute on function
+   public.enqueue_ingestion_event(jsonb) from anon, authenticated;`.
+   Re-verified: `set role anon` and `set role authenticated` against the
+   same call both now fail with `permission denied for function
+   enqueue_ingestion_event`; `set role service_role` still succeeds.
+
+All four SQL-level checks above were run directly against the live
+project, then `pgmq.purge_queue('ingestion_events')` was used to clear
+the disposable test messages afterward, leaving the queue empty rather
+than carrying stray verification data into real use. `createSupabaseEnqueueEvent()`
+(the actual TypeScript adapter apps/proxy calls, via `.rpc()`) is
+covered by this codebase's usual dependency-injected unit tests against
+an in-memory fake (see `../apps/proxy/src/routes/events.test.ts`'s
+"enqueueing onto the ingestion queue (issue 7.2)" describe block) —
+those tests do not themselves touch the network. A real-network,
+skip-by-default live test for that exact adapter function now exists
+too (`supabase-queue-repository.live.test.ts`, matching the precedent
+set by `write-llm-call-event.live.test.ts` for the write path), but
+actually running it requires the real `SUPABASE_SERVICE_ROLE_KEY`
+secret value, which this tool's Supabase access does not expose (the
+`get_publishable_keys` tool only ever returns the anon/publishable key,
+by design) — same constraint flagged for the Railway deploy gap. It's
+ready for Vivek or a future team member with that secret to run
+manually; the raw-SQL checks above are what stand in for it for now.
+
+`get_advisors` clean apart from the same pre-existing, unrelated Auth
+warning noted throughout this document.

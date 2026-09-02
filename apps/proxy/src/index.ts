@@ -1,5 +1,6 @@
 import { buildApp } from "./app.js";
 import { createServiceRoleSupabaseClient } from "./ingestion/supabase-event-repository.js";
+import { createSupabaseEnqueueEvent } from "./ingestion/supabase-queue-repository.js";
 import {
   createSupabaseApiKeyAuthDeps,
   createTouchApiKeyLastUsedAt,
@@ -29,6 +30,9 @@ const app = buildApp({
   events: {
     authApiKeyDeps: createSupabaseApiKeyAuthDeps(supabase),
     touchLastUsedAt: createTouchApiKeyLastUsedAt(supabase),
+    // Issue 7.2: enqueues onto pgmq.q_ingestion_events (issue 7.1) via
+    // the public.enqueue_ingestion_event() RPC wrapper.
+    enqueueEvent: createSupabaseEnqueueEvent(supabase),
     rateLimit: {
       store: createInMemoryRateLimitStore(),
       config: DEFAULT_INGESTION_RATE_LIMIT_CONFIG,

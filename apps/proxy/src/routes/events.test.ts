@@ -9,6 +9,7 @@ import {
   type RateLimitConfig,
 } from "../rate-limit/rate-limiter.js";
 import type { EventsRouteDeps } from "./events.js";
+import type { ValidatedEventPayload } from "../ingestion/write-llm-call-event.js";
 
 // Issue 6.3: this is the real wire shape (ingestionEventPayloadSchema,
 // snake_case per FR-6.5) -- deliberately does NOT include project_id
@@ -102,12 +103,41 @@ function makeTouchLastUsedAtRecorder(
   };
 }
 
+/**
+ * Records every payload enqueueEvent was called with, resolving with an
+ * incrementing msgId by default. Same shape as makeTouchLastUsedAtRecorder
+ * above -- tests that only care about the ordinary success path don't
+ * need to construct one (buildTestApp() defaults to an always-succeeding
+ * stub); tests in the "enqueueing onto the ingestion queue (issue 7.2)"
+ * describe block build their own so they can assert on `calls`, force a
+ * rejection, or hold the returned promise open to prove the handler
+ * genuinely awaits it.
+ */
+function makeEnqueueEventRecorder(
+  impl: (payload: ValidatedEventPayload) => Promise<{ msgId: number }> = async () => ({
+    msgId: recorderMsgIdCounter++,
+  }),
+): { enqueueEvent: EventsRouteDeps["enqueueEvent"]; calls: ValidatedEventPayload[] } {
+  const calls: ValidatedEventPayload[] = [];
+  return {
+    enqueueEvent: async (payload: ValidatedEventPayload) => {
+      calls.push(payload);
+      return impl(payload);
+    },
+    calls,
+  };
+}
+let recorderMsgIdCounter = 1;
+
 function buildTestApp(
   candidates: readonly ApiKeyCandidate[] = [candidateFor(VALID_KEY)],
   rateLimit: EventsRouteDeps["rateLimit"] = defaultRateLimitDeps(),
   touchLastUsedAt: EventsRouteDeps["touchLastUsedAt"] = async () => {},
+  enqueueEvent: EventsRouteDeps["enqueueEvent"] = async () => ({ msgId: 1 }),
 ) {
-  return buildApp({ events: { authApiKeyDeps: makeAuthDeps(candidates), rateLimit, touchLastUsedAt } });
+  return buildApp({
+    events: { authApiKeyDeps: makeAuthDeps(candidates), rateLimit, touchLastUsedAt, enqueueEvent },
+  });
 }
 
 function makeLogCapture(): { stream: Writable; lines: string[] } {
@@ -282,6 +312,7 @@ describe("POST /v1/events", () => {
           authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
           rateLimit: defaultRateLimitDeps(),
           touchLastUsedAt: async () => {},
+          enqueueEvent: async () => ({ msgId: 1 }),
         },
       },
       { logger: { level: "info", stream } },
@@ -425,6 +456,7 @@ describe("POST /v1/events", () => {
             authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
             rateLimit: defaultRateLimitDeps(),
             touchLastUsedAt: async () => {},
+            enqueueEvent: async () => ({ msgId: 1 }),
           },
         },
         { logger: { level: "info", stream } },
@@ -577,6 +609,7 @@ describe("POST /v1/events", () => {
             authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
             rateLimit: defaultRateLimitDeps(),
             touchLastUsedAt: async () => {},
+            enqueueEvent: async () => ({ msgId: 1 }),
           },
         },
         { logger: { level: "info", stream } },
@@ -737,6 +770,7 @@ describe("POST /v1/events", () => {
             authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
             rateLimit: defaultRateLimitDeps(TINY_LIMIT),
             touchLastUsedAt: async () => {},
+            enqueueEvent: async () => ({ msgId: 1 }),
           },
         },
         { logger: { level: "info", stream } },
@@ -855,6 +889,7 @@ describe("POST /v1/events", () => {
             authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY, { id: "key-1" })]),
             rateLimit: defaultRateLimitDeps(),
             touchLastUsedAt: alwaysRejects,
+            enqueueEvent: async () => ({ msgId: 1 }),
           },
         },
         { logger: { level: "info", stream } },
@@ -877,6 +912,212 @@ describe("POST /v1/events", () => {
       const failureLog = entries.find((entry) => entry.event === "last_used_at_update_failed");
       expect(failureLog).toBeDefined();
       expect(failureLog?.apiKeyId).toBe("key-1");
+    });
+  });
+
+  // Issue 7.2: every validated event is durably enqueued before the
+  // response is sent, instead of written directly to Postgres. Unlike
+  // 6.6's touchLastUsedAt, a failed enqueue genuinely fails the request
+  // (503, whole-batch) -- see events.ts's header comment for the
+  // reasoning. The real Supabase RPC round-trip itself is covered
+  // separately (supabase-queue-repository's own live test / docs/RLS.md);
+  // these tests only cover the HTTP layer's responsibility: calling
+  // enqueueEvent for every validated event, genuinely awaiting it, and
+  // turning any failure into a 503 rather than a partial 202.
+  describe("enqueueing onto the ingestion queue (issue 7.2)", () => {
+    it("enqueues the single validated event on the ordinary success path", async () => {
+      const recorder = makeEnqueueEventRecorder();
+      const app = buildTestApp(undefined, undefined, undefined, recorder.enqueueEvent);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(recorder.calls).toHaveLength(1);
+      expect(recorder.calls[0].eventId).toBe(SAMPLE_PAYLOAD.event_id);
+      // project_id is resolved from the authenticated key, not the body
+      // -- same guarantee as the direct-write path this replaces.
+      expect(recorder.calls[0].projectId).toBe("33333333-3333-3333-3333-333333333333");
+    });
+
+    it("calls enqueueEvent once per validated event in a batch (N events -> N calls)", async () => {
+      const recorder = makeEnqueueEventRecorder();
+      const app = buildTestApp(undefined, undefined, undefined, recorder.enqueueEvent);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          { ...SAMPLE_PAYLOAD, event_id: "11111111-aaaa-aaaa-aaaa-111111111111" },
+          { ...SAMPLE_PAYLOAD, event_id: "22222222-aaaa-aaaa-aaaa-222222222222" },
+          { ...SAMPLE_PAYLOAD, event_id: "33333333-aaaa-aaaa-aaaa-333333333333" },
+        ],
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(recorder.calls.map((c) => c.eventId)).toEqual([
+        "11111111-aaaa-aaaa-aaaa-111111111111",
+        "22222222-aaaa-aaaa-aaaa-222222222222",
+        "33333333-aaaa-aaaa-aaaa-333333333333",
+      ]);
+    });
+
+    it("never calls enqueueEvent when every event in a batch fails validation", async () => {
+      const recorder = makeEnqueueEventRecorder();
+      const app = buildTestApp(undefined, undefined, undefined, recorder.enqueueEvent);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          { ...SAMPLE_PAYLOAD, event_id: "11111111-aaaa-aaaa-aaaa-111111111111", provider: "cohere" },
+        ],
+      });
+
+      // Validation failure still reports 202-with-rejected-results (6.4's
+      // existing behavior, unchanged) -- there's simply nothing to
+      // enqueue.
+      expect(response.statusCode).toBe(202);
+      expect(response.json().rejected).toBe(1);
+      expect(recorder.calls).toEqual([]);
+    });
+
+    it("never calls enqueueEvent for a single (non-batch) request that fails validation", async () => {
+      const recorder = makeEnqueueEventRecorder();
+      const app = buildTestApp(undefined, undefined, undefined, recorder.enqueueEvent);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: { ...SAMPLE_PAYLOAD, input_tokens: -5 },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(recorder.calls).toEqual([]);
+    });
+
+    it("genuinely awaits enqueueEvent before responding, not fire-and-forget", async () => {
+      let resolveEnqueue!: (value: { msgId: number }) => void;
+      const pending = new Promise<{ msgId: number }>((resolve) => {
+        resolveEnqueue = resolve;
+      });
+      const app = buildTestApp(undefined, undefined, undefined, async () => pending);
+
+      const responsePromise = app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      // Give the event loop a chance to run as far as it can without the
+      // enqueue promise resolving -- if the handler were (wrongly) not
+      // awaiting enqueueEvent, the response would already be settled by
+      // now.
+      let settledEarly = false;
+      responsePromise.then(() => {
+        settledEarly = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(settledEarly).toBe(false);
+
+      resolveEnqueue({ msgId: 1 });
+      const response = await responsePromise;
+      expect(response.statusCode).toBe(202);
+    });
+
+    // AC (issue 7.2): a failed enqueue must fail the request -- unlike
+    // 6.6's best-effort touchLastUsedAt, this is the delivery guarantee
+    // the endpoint promises the caller.
+    it("returns 503 when the single event's enqueue fails", async () => {
+      const alwaysFails = async () => {
+        throw new Error("simulated queue failure");
+      };
+      const app = buildTestApp(undefined, undefined, undefined, alwaysFails);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: "failed to durably enqueue one or more events, please retry",
+        enqueueFailures: 1,
+      });
+    });
+
+    // Whole-batch 503 on partial enqueue failure, not a partial 202 --
+    // see events.ts's header comment for the judgment call and why this
+    // is safe to retry (event_id idempotency, issue 5.4).
+    it("returns a whole-batch 503 when only one of several events fails to enqueue", async () => {
+      const failingEventId = "22222222-aaaa-aaaa-aaaa-222222222222";
+      const partiallyFails = async (payload: ValidatedEventPayload) => {
+        if (payload.eventId === failingEventId) {
+          throw new Error("simulated queue failure");
+        }
+        return { msgId: 1 };
+      };
+      const app = buildTestApp(undefined, undefined, undefined, partiallyFails);
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: [
+          { ...SAMPLE_PAYLOAD, event_id: "11111111-aaaa-aaaa-aaaa-111111111111" },
+          { ...SAMPLE_PAYLOAD, event_id: failingEventId },
+          { ...SAMPLE_PAYLOAD, event_id: "33333333-aaaa-aaaa-aaaa-333333333333" },
+        ],
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: "failed to durably enqueue one or more events, please retry",
+        enqueueFailures: 1,
+      });
+    });
+
+    it("logs a structured error listing the failed event ids when enqueue fails", async () => {
+      const { stream, lines } = makeLogCapture();
+      const alwaysFails = async () => {
+        throw new Error("simulated queue failure");
+      };
+      const app = buildApp(
+        {
+          events: {
+            authApiKeyDeps: makeAuthDeps([candidateFor(VALID_KEY)]),
+            rateLimit: defaultRateLimitDeps(),
+            touchLastUsedAt: async () => {},
+            enqueueEvent: alwaysFails,
+          },
+        },
+        { logger: { level: "info", stream } },
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: { "x-api-key": VALID_KEY },
+        payload: SAMPLE_PAYLOAD,
+      });
+      await app.close();
+
+      expect(response.statusCode).toBe(503);
+      const entries = parseLines(lines);
+      const failureLog = entries.find((entry) => entry.event === "enqueue_failed");
+      expect(failureLog).toBeDefined();
+      expect(failureLog?.enqueueFailureCount).toBe(1);
+      expect(failureLog?.failedEventIds).toEqual([SAMPLE_PAYLOAD.event_id]);
     });
   });
 });

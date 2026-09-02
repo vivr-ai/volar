@@ -1,0 +1,28 @@
+-- Issue 7.2 follow-up: `revoke ... from public` alone did NOT lock
+-- this function down. Verified live (not assumed): after the prior
+-- migration, `set role anon; select public.enqueue_ingestion_event(...)`
+-- *succeeded* -- a real gap, caught before merge, not after. Root
+-- cause: this project's Supabase instance carries a default privilege
+-- rule (set up by Supabase itself at project creation, before any of
+-- this project's own migrations) granting EXECUTE on every new
+-- `public`-schema function to `anon`/`authenticated` automatically.
+-- Revoking from the `public` pseudo-role does not touch a privilege
+-- granted directly to a named role -- the two are independent grants,
+-- confirmed via `information_schema.role_routine_grants` showing
+-- `anon`/`authenticated` both listed with real EXECUTE grants even
+-- after the "revoke ... from public" line ran.
+--
+-- Same lesson this project already learned once for a table (see
+-- `fix_tag_upsert_grants`, issue 3.4's own follow-up migration) --
+-- now confirmed to apply to `public`-schema *functions* too. Every
+-- future `public`-schema function this project adds needs its own
+-- explicit `revoke ... from anon, authenticated` unless it is
+-- deliberately meant to be customer-callable.
+--
+-- Re-verified after this migration: `set role anon` and
+-- `set role authenticated` both now fail with "permission denied for
+-- function enqueue_ingestion_event"; `set role service_role` still
+-- succeeds. See docs/RLS.md's "Ingestion queue enqueue wrapper" entry
+-- for the full before/after transcript.
+
+revoke execute on function public.enqueue_ingestion_event(jsonb) from anon, authenticated;

@@ -78,11 +78,21 @@ activity visibility) on `apps/proxy`. Epic 7 (Managed Queue), issue
 7.1 — ingestion queue provisioned via Supabase's `pgmq` extension
 (judgment call over Upstash Redis/QStash, both PRD-sanctioned per NFR
 §10.4 — see `supabase/migrations/20260902071700_ingestion_queue_pgmq.sql`),
-live-verified enqueue/dequeue cycle, no new secrets required.
+live-verified enqueue/dequeue cycle, no new secrets required. Issue 7.2
+— `POST /v1/events` now durably enqueues every validated event onto
+`pgmq.q_ingestion_events` (via a `SECURITY DEFINER` RPC wrapper,
+`public.enqueue_ingestion_event`, since `pgmq` isn't directly reachable
+through PostgREST) instead of writing to `llm_call_events` directly; a
+failed enqueue now fails the whole request (503, safe to retry given
+issue 5.4's `event_id` idempotency) rather than silently dropping data.
+Live testing caught and fixed a real access-control gap (`anon` could
+call the wrapper despite a `revoke ... from public`) before merge — see
+`docs/RLS.md`.
 
-**Next up:** Epic 7 (Managed Queue), issue 7.2 — `POST /v1/events`
-enqueues onto `pgmq.q_ingestion_events` instead of writing to
-`llm_call_events` directly, on `apps/proxy`.
+**Next up:** Epic 7 (Managed Queue), issue 7.3 — worker that dequeues
+from `pgmq.q_ingestion_events`, validates, computes cost, and inserts
+into `llm_call_events` (the consumer side of 7.1/7.2's queue), on
+`apps/proxy`.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.
