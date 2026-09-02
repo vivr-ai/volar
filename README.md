@@ -74,11 +74,15 @@ FR-6.5), batch support (array of events per FR-6.8, partial-failure-
 tolerant), per-API-key rate limiting (429 + Retry-After, in-memory
 fixed-window, documented 300 req/min threshold), and a fire-and-forget
 `api_keys.last_used_at` update on successful auth (PRD §10.3 key-
-activity visibility) on `apps/proxy`.
+activity visibility) on `apps/proxy`. Epic 7 (Managed Queue), issue
+7.1 — ingestion queue provisioned via Supabase's `pgmq` extension
+(judgment call over Upstash Redis/QStash, both PRD-sanctioned per NFR
+§10.4 — see `supabase/migrations/20260902071700_ingestion_queue_pgmq.sql`),
+live-verified enqueue/dequeue cycle, no new secrets required.
 
-**Next up:** Epic 7 (Managed Queue), issue 7.1 — provision managed
-queue (Upstash Redis/QStash) for decoupling ingestion rate from write
-rate.
+**Next up:** Epic 7 (Managed Queue), issue 7.2 — `POST /v1/events`
+enqueues onto `pgmq.q_ingestion_events` instead of writing to
+`llm_call_events` directly, on `apps/proxy`.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.

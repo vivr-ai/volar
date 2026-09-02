@@ -30,7 +30,6 @@ not even old/rotated ones.
 | `SUPABASE_URL` | proxy | Railway (staging + production) | Reserved for Epic 5/6 |
 | `SUPABASE_SERVICE_ROLE_KEY` | proxy | Railway (staging + production) | Reserved for Epic 5/6 — **never** give this to the dashboard; it bypasses RLS entirely |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | `packages/internal-cli` (issue 4.5) | Local-only `.env`, never deployed to any platform | Live — used only when a team member runs the price-table CLI by hand |
-| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | proxy | Railway (staging + production) | Reserved for Epic 7 |
 | `SENTRY_DSN` | proxy | Railway (staging + production) | Reserved for issue 19.2 |
 | `AXIOM_TOKEN` | proxy | Railway (staging + production) | Reserved for issue 19.3 |
 | `ANTHROPIC_API_KEY` | proxy (tentative — see note in `apps/proxy/.env.example`) | Railway (staging + production) | Reserved for Epic 18 |
@@ -39,10 +38,26 @@ not even old/rotated ones.
 later issue doesn't have to invent a naming convention under time
 pressure — none of these are read by any code yet as of issue 1.9.
 
+**Update (issue 7.1):** the `UPSTASH_REDIS_REST_URL` / `_TOKEN` row this
+section originally reserved is gone, not just renamed — the ingestion
+queue ended up built on Supabase's `pgmq` extension instead of Upstash
+(see `supabase/migrations/20260902071700_ingestion_queue_pgmq.sql` for
+the full reasoning), so it's reached through the existing
+`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` pair above rather than a
+secret of its own. This is the one place this doc's original table
+turned out to reserve a name for something that, once actually built,
+needed no new secret at all.
+
 Note one deliberate asymmetry: staging and production get **separate**
 values for every secret above (separate Supabase project or at minimum
-separate keys, separate queue instance, etc., as those pieces come
-online) — never share a production credential into staging.
+separate keys, as those pieces come online) — never share a production
+credential into staging. The queue is the one exception as of issue
+7.1: Volar currently runs a single shared Supabase project for both
+Railway environments (true for every other Supabase-backed piece of
+this stack already, not a new gap introduced here), so "staging" and
+"production" both reach the *same* `pgmq.q_ingestion_events` queue for
+now. Revisit if/when this project ever splits into genuinely separate
+staging/production Supabase projects.
 
 ## Rotating a secret
 

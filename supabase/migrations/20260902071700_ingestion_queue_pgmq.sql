@@ -1,0 +1,47 @@
+-- Issue 7.1 (Epic 7): provision the managed queue that decouples
+-- ingestion rate from write rate.
+--
+-- PRD NFR §10.4 names three acceptable options for this: "Upstash
+-- Redis/QStash or Supabase-native queuing". Judgment call (flagged
+-- explicitly per the Working Agreement, made with Vivek's direct
+-- confirmation in-conversation, not decided silently): this migration
+-- picks Supabase-native queuing over Upstash, using pgmq -- the
+-- extension Supabase's own "Queues" product is built on -- rather than
+-- signing up for a brand-new external vendor. Reasoning:
+--   1. Vivek is a non-technical founder; this avoids a second external
+--      account/credential pair (Upstash sign-up, API keys to copy into
+--      Railway) for something the PRD itself already treats as an
+--      equally valid choice.
+--   2. The proxy already holds a service_role Supabase client for
+--      every other write (issue 5.2 onward) -- reusing that exact
+--      connection for the queue means AC2 ("credentials wired into
+--      proxy service environment config") needs *no new secret at
+--      all*, only new query logic in a later issue (7.2/7.3).
+--   3. V1's actual scale (a handful of design partners) does not need
+--      a dedicated high-throughput message broker; pgmq (backed by
+--      plain Postgres tables with SKIP LOCKED-based dequeue) is more
+--      than sufficient and is trivially swappable later behind the
+--      same WriteLlmCallEventDeps-style injected-dependency pattern
+--      already used everywhere else in apps/proxy, should real volume
+--      ever demand a dedicated broker.
+--
+-- apps/proxy/.env.example's now-removed Upstash placeholder section
+-- (added speculatively back in issue 1.9) is updated in the same
+-- commit as this migration to reflect this decision.
+--
+-- pgmq.create() below creates two real tables:
+--   pgmq.q_ingestion_events  -- the live queue (msg_id, message jsonb,
+--                                enqueued_at, vt [visibility timeout],
+--                                read_ct)
+--   pgmq.a_ingestion_events  -- archive table pgmq.archive() moves
+--                                completed messages into, for the
+--                                short-term audit trail this project's
+--                                testing discipline favors elsewhere
+--                                (e.g. RLS.md's disposable-row pattern)
+-- Both live in the `pgmq` schema pgmq itself creates, not `public` --
+-- consistent with every other table in this project defaulting to
+-- "no access unless explicitly granted" (see docs/RLS.md).
+
+create extension if not exists pgmq;
+
+select pgmq.create('ingestion_events');

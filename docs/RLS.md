@@ -330,3 +330,42 @@ while `insert ... on conflict (event_id) do nothing` — what the
 application code actually uses — silently no-ops, leaving exactly one
 row. `get_advisors` clean apart from the same pre-existing, unrelated
 Auth warning.
+
+## Ingestion queue — `pgmq` (issue 7.1)
+
+The `pgmq` extension (Supabase's own "Queues" product) lives in its own
+`pgmq` schema, outside `public` — same default-deny posture as
+everything else in this document. Installing the extension alone does
+**not** grant the proxy's `service_role` client anything: a follow-up
+grants migration was required after a live test proved this (see
+below), which is exactly the kind of gap this project's testing
+discipline exists to catch before it reaches production, not after.
+
+Verified directly, in this order:
+
+1. After the first migration (`create extension pgmq;` +
+   `pgmq.create('ingestion_events')`) alone: `set role service_role;
+   select pgmq.send('ingestion_events', ...)` failed with `permission
+   denied for schema pgmq` — confirming the gap rather than assuming
+   the extension's default grants were sufficient.
+2. After the grants migration (`grant usage on schema pgmq to
+   service_role` + `grant all ... to service_role` on existing and,
+   via `alter default privileges`, future tables/functions/sequences):
+   the same `pgmq.send(...)` call as `service_role` succeeded, returning
+   a real `msg_id`.
+3. Full manual enqueue → dequeue cycle as `service_role` (AC3 of issue
+   7.1): `pgmq.send()` enqueued a test message; `pgmq.read()` retrieved
+   it with a visibility timeout (the "a worker is looking at this,
+   don't hand it to anyone else yet" read pattern); `pgmq.pop()`
+   (read-and-delete-atomically) removed it once the timeout had
+   elapsed. `select count(*) from pgmq.q_ingestion_events` returned `0`
+   afterward — queue left empty, not carrying a stray verification
+   message into real use.
+4. Negative check: `set role anon; select pgmq.send(...)` failed with
+   the same `permission denied for schema pgmq` — confirming the
+   default-deny posture holds for the one role this queue must never be
+   reachable from directly (customers only ever reach it indirectly,
+   through `POST /v1/events`, once issue 7.2 wires that up).
+
+`get_advisors` clean apart from the same pre-existing, unrelated Auth
+warning noted throughout this document.
