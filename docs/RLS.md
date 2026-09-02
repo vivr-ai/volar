@@ -436,3 +436,45 @@ manually; the raw-SQL checks above are what stand in for it for now.
 
 `get_advisors` clean apart from the same pre-existing, unrelated Auth
 warning noted throughout this document.
+
+## Worker RPC wrappers — dequeue/archive (issue 7.3)
+
+Same PostgREST-doesn't-expose-`pgmq` reasoning as issue 7.2's
+`enqueue_ingestion_event`, applied to the worker's two operations: two
+more narrow `public`-schema `SECURITY DEFINER` wrappers,
+`public.dequeue_ingestion_events(vt, qty)` (wraps `pgmq.read()`) and
+`public.archive_ingestion_event(msg_id)` (wraps `pgmq.archive()`).
+
+Unlike issue 7.2, the `anon`/`authenticated` lockdown was written into
+the *same* migration as the functions themselves this time, applying
+the lesson issue 7.2 learned live rather than repeating the same gap.
+Verified live regardless, not assumed correct just because "we already
+know the fix":
+
+1. `set role anon; select * from public.dequeue_ingestion_events(30, 5);`
+   — failed immediately with `permission denied for function
+   dequeue_ingestion_events`.
+2. `set role authenticated;` against the same call — failed the same
+   way.
+3. `reset role; select public.enqueue_ingestion_event(...)` (issue
+   7.2's function, to seed a real message) — succeeded, `msg_id 6`.
+4. `select * from public.dequeue_ingestion_events(30, 5);` as
+   `service_role` — succeeded, returned the seeded message with
+   `read_ct: 1` and the exact jsonb payload intact.
+5. `select public.archive_ingestion_event(6);` as `service_role` —
+   succeeded (`true`); `select count(*) from pgmq.q_ingestion_events`
+   immediately after — `0`, confirming the message actually left the
+   live queue (moved to `pgmq.a_ingestion_events`, not deleted outright
+   — see the migration's own comment for why archiving over deleting
+   was chosen for this project).
+
+`get_advisors` clean apart from the same pre-existing, unrelated Auth
+warning noted throughout this document.
+
+The worker's own read-insert-archive cycle (the actual TypeScript code
+path, not just the raw RPCs) is covered by `run-worker-cycle.test.ts` /
+`run-worker-loop.test.ts` (in-memory fakes) and by
+`worker-cycle.live.test.ts` (issue 7.3 AC3's literal stated test —
+"enqueue a message, assert a row appears" — skip-gated the same way as
+`supabase-queue-repository.live.test.ts`, for the same
+service-role-secret-access reason noted above).

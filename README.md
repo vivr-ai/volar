@@ -87,12 +87,24 @@ failed enqueue now fails the whole request (503, safe to retry given
 issue 5.4's `event_id` idempotency) rather than silently dropping data.
 Live testing caught and fixed a real access-control gap (`anon` could
 call the wrapper despite a `revoke ... from public`) before merge — see
-`docs/RLS.md`.
+`docs/RLS.md`. Issue 7.3 — the consumer side of the queue: a background
+worker (`apps/proxy/src/worker.ts`, running in-process alongside the
+HTTP server by default — see that file's judgment-call comment) that
+continuously dequeues messages (`public.dequeue_ingestion_events`,
+another narrow RPC wrapper), re-validates each one (a queue message is
+treated as untrusted input, not re-trusted just because issue 7.2
+already validated it once), computes cost and inserts via issue 5.2's
+`writeLlmCallEvent`, then archives only on a confirmed insert
+(`public.archive_ingestion_event`). A message that fails validation or
+insert is deliberately left unarchived — it becomes visible again via
+`pgmq`'s own visibility timeout and gets retried, which is what makes
+restart-safety (AC2) hold for free; a permanent poison-pill retrying
+forever is issue 7.4's dead-letter problem, not this one's, per the
+backlog's own framing.
 
-**Next up:** Epic 7 (Managed Queue), issue 7.3 — worker that dequeues
-from `pgmq.q_ingestion_events`, validates, computes cost, and inserts
-into `llm_call_events` (the consumer side of 7.1/7.2's queue), on
-`apps/proxy`.
+**Next up:** Epic 7 (Managed Queue), issue 7.4 — dead-letter handling:
+move an event that fails processing beyond a retry threshold to a
+dead-letter table for manual inspection, instead of retrying forever.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.

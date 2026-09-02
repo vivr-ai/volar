@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:worker": "tsx watch src/worker.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "start:worker": "node dist/worker.js",
     "lint": "eslint src",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
@@ -14,7 +16,8 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.112.2",
     "@volar/shared": "workspace:*",
-    "fastify": "^5.1.0"
+    "fastify": "^5.1.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@volar/config": "workspace:*",

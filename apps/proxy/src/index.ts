@@ -9,9 +9,17 @@ import {
   createInMemoryRateLimitStore,
   DEFAULT_INGESTION_RATE_LIMIT_CONFIG,
 } from "./rate-limit/rate-limiter.js";
+import { startRealWorkerLoop } from "./worker.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
+// Issue 7.3 judgment call (see worker.ts's own header comment for the
+// full reasoning): the queue worker runs in this same process by
+// default, alongside the HTTP server, rather than requiring a second
+// Railway service for V1. Set WORKER_ENABLED=false on this service's
+// variables if/when the worker is later split out to run as its own
+// service via `pnpm --filter @volar/proxy start:worker` instead.
+const WORKER_ENABLED = (process.env.WORKER_ENABLED ?? "true") !== "false";
 
 // Issue 6.2: real API-key auth needs a real DB client. Constructed here
 // (not inside app.ts/buildApp) so buildApp() stays testable without
@@ -49,3 +57,22 @@ app
     app.log.error(err);
     process.exit(1);
   });
+
+// Issue 7.3: start the queue worker loop in-process, after the HTTP
+// server is listening -- an async loop awaiting real I/O (Supabase RPC
+// calls) between iterations yields the event loop just like any other
+// pending request, so it does not block the server from handling
+// traffic. Not awaited: this call returns immediately once the loop has
+// been kicked off (see startWorkerLoop's own doc comment) -- it runs
+// for the lifetime of the process, same as app.listen() above.
+if (WORKER_ENABLED) {
+  const workerHandle = startRealWorkerLoop();
+
+  const shutdownWorker = () => {
+    workerHandle.stop();
+  };
+  process.on("SIGTERM", shutdownWorker);
+  process.on("SIGINT", shutdownWorker);
+} else {
+  app.log.info("WORKER_ENABLED=false -- queue worker not started in this process");
+}
