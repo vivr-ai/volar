@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { startWorkerLoop, type WorkerLoopDeps } from "./run-worker-loop.js";
 import type { DequeuedMessage } from "./queue-message.js";
 
-const CONFIG = { visibilityTimeoutSeconds: 30, batchSize: 10, emptyPollDelayMs: 1000 };
+const CONFIG = { visibilityTimeoutSeconds: 30, batchSize: 10, emptyPollDelayMs: 1000, maxAttempts: 5 };
+const noopDeadLetter = async () => {};
 
 function messageFor(msgId: number): DequeuedMessage {
   return { msgId, readCt: 1, enqueuedAt: "2026-08-09T00:00:00.000Z", vt: "2026-08-09T00:00:30.000Z", message: {} };
@@ -23,6 +24,7 @@ describe("startWorkerLoop", () => {
       dequeueMessages: async () => [],
       archiveMessage: async () => {},
       processMessage: async (msg) => ({ outcome: "inserted", msgId: msg.msgId, wasDuplicate: false }),
+      deadLetterMessage: noopDeadLetter,
     };
 
     const handle = startWorkerLoop(deps, CONFIG, (event) => logs.push(event));
@@ -48,6 +50,7 @@ describe("startWorkerLoop", () => {
       },
       archiveMessage: async () => {},
       processMessage: async (msg) => ({ outcome: "inserted", msgId: msg.msgId, wasDuplicate: false }),
+      deadLetterMessage: noopDeadLetter,
     };
 
     const handle = startWorkerLoop(deps, CONFIG, () => {});
@@ -76,6 +79,7 @@ describe("startWorkerLoop", () => {
       },
       archiveMessage: async () => {},
       processMessage: async (msg) => ({ outcome: "inserted", msgId: msg.msgId, wasDuplicate: false }),
+      deadLetterMessage: noopDeadLetter,
     };
 
     const handle = startWorkerLoop(deps, CONFIG, () => {});
@@ -104,6 +108,7 @@ describe("startWorkerLoop", () => {
       },
       archiveMessage: async () => {},
       processMessage: async (msg) => ({ outcome: "inserted", msgId: msg.msgId, wasDuplicate: false }),
+      deadLetterMessage: noopDeadLetter,
     };
 
     const handle = startWorkerLoop(deps, CONFIG, (event) => events.push(event));
@@ -127,6 +132,7 @@ describe("startWorkerLoop", () => {
         archiveCalled = true;
       },
       processMessage: async (msg) => ({ outcome: "inserted", msgId: msg.msgId, wasDuplicate: false }),
+      deadLetterMessage: noopDeadLetter,
     };
 
     const handle = startWorkerLoop(deps, CONFIG, () => {});

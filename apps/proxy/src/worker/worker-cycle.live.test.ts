@@ -5,6 +5,7 @@ import { createSupabaseEventWriteDeps } from "../ingestion/supabase-event-reposi
 import { alertPriceUnresolvedViaConsole } from "../ingestion/alerts.js";
 import { writeLlmCallEvent } from "../ingestion/write-llm-call-event.js";
 import { createSupabaseWorkerQueueDeps } from "./supabase-worker-queue-repository.js";
+import { createSupabaseDeadLetterRepository } from "./supabase-dead-letter-repository.js";
 import { processQueueMessage } from "./process-queue-message.js";
 import { runWorkerCycle } from "./run-worker-cycle.js";
 
@@ -42,6 +43,7 @@ describe.skipIf(!hasLiveCreds)("worker cycle end-to-end (live Supabase)", () => 
       ...createSupabaseEventWriteDeps(supabase),
       alertPriceUnresolved: alertPriceUnresolvedViaConsole,
     };
+    const deadLetterMessage = createSupabaseDeadLetterRepository(supabase);
 
     const eventId = crypto.randomUUID();
     // Real seeded Claude Sonnet 5 v1 price (same fixture used by
@@ -64,8 +66,9 @@ describe.skipIf(!hasLiveCreds)("worker cycle end-to-end (live Supabase)", () => 
         archiveMessage: queueDeps.archiveMessage,
         processMessage: (msg) =>
           processQueueMessage({ writeLlmCallEvent: (payload) => writeLlmCallEvent(writeDeps, payload) }, msg),
+        deadLetterMessage,
       },
-      { visibilityTimeoutSeconds: 30, batchSize: 10 },
+      { visibilityTimeoutSeconds: 30, batchSize: 10, maxAttempts: 5 },
     );
 
     expect(cycleResult.inserted).toBeGreaterThanOrEqual(1);

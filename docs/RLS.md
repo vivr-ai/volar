@@ -478,3 +478,51 @@ path, not just the raw RPCs) is covered by `run-worker-cycle.test.ts` /
 "enqueue a message, assert a row appears" — skip-gated the same way as
 `supabase-queue-repository.live.test.ts`, for the same
 service-role-secret-access reason noted above).
+
+## Dead-letter table (issue 7.4)
+
+`public.ingestion_dead_letters` (this issue's own migration) is a plain
+table, not a `pgmq`-schema object — no RPC wrapper needed the way
+enqueue/dequeue/archive needed one; the worker's `service_role` client
+writes to it via a direct `.from(...).insert(...)` call, same as every
+other plain-table write in this project. RLS is enabled with **no
+policies** — the same default-deny-everything posture as every other
+table in this document, deliberately with nothing carved out yet for
+`authenticated`/`anon` since no V1 PRD/backlog item asks for a
+customer-facing view of dead-lettered events.
+
+Verified directly, in this order:
+
+1. `set role anon;` then attempting an insert — failed with `new row
+   violates row-level security policy for table "ingestion_dead_letters"`.
+   (A plain `select count(*)` as `anon` did *not* error — it succeeded
+   and returned `0`, which is the correct outcome via a different
+   mechanism: `anon` apparently has a table-level SELECT grant from the
+   same kind of project-wide default-privilege rule seen in issues 7.2/
+   7.3, but RLS with zero policies filters every row regardless, so the
+   net result — `anon` can see none of this table's data — holds either
+   way. Confirmed this doesn't extend to writing: the INSERT attempt
+   above was denied outright.)
+2. `set role authenticated;` — the same insert attempt failed the same
+   way.
+3. `reset role;` (`service_role`) — the same insert succeeded, and a
+   follow-up `select` confirmed the row's columns matched exactly what
+   was written; the probe row was then deleted, leaving the table
+   empty.
+
+`get_advisors` reports one new, expected, informational item —
+`rls_enabled_no_policy` for `public.ingestion_dead_letters` — which is
+exactly the intended state (RLS on, no policies, default-deny), not a
+gap; noted here so it isn't mistaken for an oversight on a future pass.
+Otherwise clean apart from the same pre-existing, unrelated Auth
+warning noted throughout this document.
+
+The dead-letter *decision* logic (when a repeatedly-failing message
+actually gets moved here, keyed off pgmq's own per-message `read_ct`)
+is pure and covered entirely by fast in-memory unit tests
+(`dead-letter.test.ts`, and the "dead-lettering (issue 7.4)" describe
+block in `run-worker-cycle.test.ts`) rather than a live test that waits
+through several real visibility-timeout cycles — see
+`supabase-dead-letter-repository.live.test.ts`'s header comment for why
+that split was chosen, matching the precedent set for the enqueue/
+dequeue RPC paths.

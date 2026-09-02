@@ -1,5 +1,6 @@
 import type { DequeuedMessage } from "./queue-message.js";
 import type { ProcessMessageOutcome } from "./process-queue-message.js";
+import { isFinalAttempt, buildDeadLetterRow, type DeadLetterRow } from "./dead-letter.js";
 
 // Issue 7.3: one full "dequeue -> validate -> cost-compute -> insert"
 // pass -- the "dequeue" step itself, plus wiring processQueueMessage's
@@ -9,6 +10,10 @@ import type { ProcessMessageOutcome } from "./process-queue-message.js";
 // archiveMessage/processMessage -- run-worker-loop.ts is the thin layer
 // above this that turns "one cycle" into "cycles forever, with a poll
 // delay when there was nothing to do."
+//
+// Issue 7.4: adds the dead-letter decision -- see the loop body below
+// for exactly where a repeatedly-failing message stops being retried
+// and gets moved out of the live queue instead.
 
 export interface WorkerCycleDeps {
   dequeueMessages: (
@@ -17,6 +22,11 @@ export interface WorkerCycleDeps {
   ) => Promise<DequeuedMessage[]>;
   archiveMessage: (msgId: number) => Promise<void>;
   processMessage: (dequeued: DequeuedMessage) => Promise<ProcessMessageOutcome>;
+  /** Issue 7.4: writes a row to public.ingestion_dead_letters. Called
+   * only for a message that has failed (validation or write) on what
+   * this cycle determines is its final allowed attempt -- see
+   * isFinalAttempt/buildDeadLetterRow in dead-letter.ts. */
+  deadLetterMessage: (row: DeadLetterRow) => Promise<void>;
 }
 
 export interface WorkerCycleConfig {
@@ -30,6 +40,11 @@ export interface WorkerCycleConfig {
   visibilityTimeoutSeconds: number;
   /** Max messages claimed per dequeueMessages call. */
   batchSize: number;
+  /** Issue 7.4, AC1's "N attempts": once a message's own pgmq read_ct
+   * reaches this number and it *still* fails (validation or write),
+   * it's moved to the dead-letter table instead of being left to retry
+   * again. See dead-letter.ts's isFinalAttempt. */
+  maxAttempts: number;
 }
 
 export interface WorkerCycleResult {
@@ -37,6 +52,10 @@ export interface WorkerCycleResult {
   inserted: number;
   invalid: number;
   failed: number;
+  /** Issue 7.4: messages moved to public.ingestion_dead_letters this
+   * cycle -- mutually exclusive with invalid/failed above (a
+   * dead-lettered message is counted here only, not double-counted). */
+  deadLettered: number;
   /** Count of messages that were successfully inserted (already counted
    * in `inserted`) but whose archiveMessage call itself then threw. Not
    * a data-loss risk -- see runWorkerCycle's comment on why an
@@ -77,6 +96,7 @@ export async function runWorkerCycle(
     inserted: 0,
     invalid: 0,
     failed: 0,
+    deadLettered: 0,
     archiveFailed: 0,
   };
 
@@ -87,19 +107,48 @@ export async function runWorkerCycle(
       result.inserted++;
       // Only a confirmed insert gets archived -- see
       // process-queue-message.ts's header comment for why "invalid" and
-      // "failed" outcomes deliberately do not. Wrapped in its own
-      // try/catch so an archive failure (the row is already safely
-      // written -- only the queue bookkeeping failed) doesn't abort
-      // processing of the rest of this batch; the message will simply
-      // become visible again and get reprocessed, which issue 5.4's
-      // event_id idempotency makes a safe no-op rather than a duplicate
-      // row.
+      // "failed" outcomes deliberately do not (short of the dead-letter
+      // path below). Wrapped in its own try/catch so an archive failure
+      // (the row is already safely written -- only the queue
+      // bookkeeping failed) doesn't abort processing of the rest of
+      // this batch; the message will simply become visible again and
+      // get reprocessed, which issue 5.4's event_id idempotency makes a
+      // safe no-op rather than a duplicate row.
       try {
         await deps.archiveMessage(outcome.msgId);
       } catch {
         result.archiveFailed++;
       }
-    } else if (outcome.outcome === "invalid") {
+      continue;
+    }
+
+    // Issue 7.4: a message that has now failed (validation or write) on
+    // what pgmq's own read_ct says is its final allowed attempt gets
+    // moved to the dead-letter table instead of being left to retry
+    // forever. Deliberately re-checked on *every* failing attempt
+    // (not just "the Nth"), using >= rather than ===, so a message
+    // somehow read more times than maxAttempts (e.g. two overlapping
+    // worker instances) still gets caught rather than slipping past the
+    // threshold.
+    if (isFinalAttempt(message, config.maxAttempts)) {
+      try {
+        await deps.deadLetterMessage(buildDeadLetterRow(message, outcome));
+        // Only remove it from the live queue once the dead-letter row
+        // is confirmed written -- see this issue's own AC3 ("no event
+        // is ever silently discarded without a trace"). If either call
+        // throws, the message is deliberately left un-archived and
+        // falls through to the ordinary invalid/failed counting below,
+        // so it simply gets picked up and re-attempted next cycle
+        // rather than being lost.
+        await deps.archiveMessage(message.msgId);
+        result.deadLettered++;
+        continue;
+      } catch {
+        // Fall through to ordinary invalid/failed counting.
+      }
+    }
+
+    if (outcome.outcome === "invalid") {
       result.invalid++;
     } else {
       result.failed++;

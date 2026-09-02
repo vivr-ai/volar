@@ -100,11 +100,20 @@ insert is deliberately left unarchived — it becomes visible again via
 `pgmq`'s own visibility timeout and gets retried, which is what makes
 restart-safety (AC2) hold for free; a permanent poison-pill retrying
 forever is issue 7.4's dead-letter problem, not this one's, per the
-backlog's own framing.
+backlog's own framing. Issue 7.4 — dead-letter handling closes that gap:
+once a message has been attempted `WORKER_MAX_ATTEMPTS` times (default
+5, tracked via `pgmq`'s own per-message `read_ct`) and still fails, it's
+moved into a new `public.ingestion_dead_letters` table (with the full
+payload, failure reason, and last error attached) and removed from the
+live queue, instead of retrying forever. No RPC wrapper needed for this
+one — it's a plain table, not a `pgmq`-schema object — but it gets the
+same default-deny RLS posture (enabled, no policies) as everything else
+in this project; live-verified that `anon`/`authenticated` cannot write
+to it while `service_role` can — see `docs/RLS.md`.
 
-**Next up:** Epic 7 (Managed Queue), issue 7.4 — dead-letter handling:
-move an event that fails processing beyond a retry threshold to a
-dead-letter table for manual inspection, instead of retrying forever.
+**Next up:** Epic 7 (Managed Queue), issue 7.5 — load test: simulate a
+burst-traffic spike against the full queue+worker path and confirm zero
+events are lost and the proxy's latency budget (PRD NFR §10.2) holds.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.

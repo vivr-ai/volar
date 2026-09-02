@@ -2,6 +2,7 @@ import { createServiceRoleSupabaseClient, createSupabaseEventWriteDeps } from ".
 import { alertPriceUnresolvedViaConsole } from "./ingestion/alerts.js";
 import { writeLlmCallEvent } from "./ingestion/write-llm-call-event.js";
 import { createSupabaseWorkerQueueDeps } from "./worker/supabase-worker-queue-repository.js";
+import { createSupabaseDeadLetterRepository } from "./worker/supabase-dead-letter-repository.js";
 import { processQueueMessage } from "./worker/process-queue-message.js";
 import { startWorkerLoop, type WorkerLoopConfig } from "./worker/run-worker-loop.js";
 
@@ -32,11 +33,20 @@ import { startWorkerLoop, type WorkerLoopConfig } from "./worker/run-worker-loop
 const VISIBILITY_TIMEOUT_SECONDS = Number(process.env.WORKER_VISIBILITY_TIMEOUT_SECONDS ?? 30);
 const BATCH_SIZE = Number(process.env.WORKER_BATCH_SIZE ?? 10);
 const EMPTY_POLL_DELAY_MS = Number(process.env.WORKER_EMPTY_POLL_DELAY_MS ?? 2000);
+// Issue 7.4, AC1's "N attempts". 5 is a judgment call, flagged: at the
+// default 30s visibility timeout, that's at least ~2.5 minutes of
+// retrying a transient failure (a brief Supabase blip, a momentary
+// network hiccup) before giving up -- generous enough not to dead-letter
+// something that would have succeeded on its own, without leaving a
+// genuine poison pill retrying for hours. Revisit once real failure
+// patterns are observed (Epic 19 observability).
+const MAX_ATTEMPTS = Number(process.env.WORKER_MAX_ATTEMPTS ?? 5);
 
 export const WORKER_LOOP_CONFIG: WorkerLoopConfig = {
   visibilityTimeoutSeconds: VISIBILITY_TIMEOUT_SECONDS,
   batchSize: BATCH_SIZE,
   emptyPollDelayMs: EMPTY_POLL_DELAY_MS,
+  maxAttempts: MAX_ATTEMPTS,
 };
 
 function structuredLog(event: string, fields: Record<string, unknown> = {}): void {
@@ -63,6 +73,7 @@ export function startRealWorkerLoop() {
     ...createSupabaseEventWriteDeps(supabase),
     alertPriceUnresolved: alertPriceUnresolvedViaConsole,
   };
+  const deadLetterMessage = createSupabaseDeadLetterRepository(supabase);
 
   return startWorkerLoop(
     {
@@ -70,6 +81,7 @@ export function startRealWorkerLoop() {
       archiveMessage: queueDeps.archiveMessage,
       processMessage: (message) =>
         processQueueMessage({ writeLlmCallEvent: (payload) => writeLlmCallEvent(writeDeps, payload) }, message),
+      deadLetterMessage,
     },
     WORKER_LOOP_CONFIG,
     structuredLog,
