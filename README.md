@@ -134,8 +134,29 @@ is no longer treated as NFR §10.2 itself; a true measurement needs a
 real SDK (Epic 9/10). See `docs/RLS.md`'s "Load test fixtures" section
 and issue 7.5's own delivery write-up for the full reasoning.
 
-**Next up:** Epic 7 (Managed Queue) is complete. Scope the next epic's
-first issue with Vivek.
+Epic 7 (Managed Queue) is complete.
+
+Issue 8.0 — `public.daily_cost_rollups` (PRD §7 DailyCostRollup),
+opening Epic 8 (Daily Rollup Job). The pre-aggregated table every
+dashboard query in §5.2–§5.4 will read from instead of scanning raw
+`llm_call_events` for any complete historical day. A real risk here,
+checked rather than assumed: PRD §7's grain
+`(project, date, provider, model, customer_id, feature_id)` isn't
+actually enforced by a plain `UNIQUE` constraint when `customer_id`/
+`feature_id` are both null — Postgres treats every `NULL` as distinct,
+so two untagged rows for the same day/provider/model could otherwise
+coexist, breaking the future rollup job's idempotent-upsert requirement
+for what's likely the single most common case (no tags configured yet).
+Fixed with two generated columns (`customer_id_key`/`feature_id_key`,
+`coalesce(..., '')`) that the real unique constraint targets instead.
+Live-verified: an untagged row inserted twice via the exact upsert
+shape the rollup job will use collapsed into one row with correctly
+summed totals, not two. RLS (project-scoped SELECT only, same posture
+as `llm_call_events`) live-verified both directions — see
+`docs/RLS.md`'s "DailyCostRollup (issue 8.0)" section.
+
+**Next up:** issue 8.1 — scheduled job scaffold (cron) that will
+eventually run the rollup aggregation once per day.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.

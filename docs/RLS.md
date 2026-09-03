@@ -572,3 +572,54 @@ behind by a crashed run (teardown not reached) is easy to identify and
 hand-delete — `delete from public.organizations where name like 'Load
 Test Org%'` cascades through the same FK chain teardownLoadTestFixtures
 itself uses.
+
+## DailyCostRollup (issue 8.0)
+
+`public.daily_cost_rollups` (Epic 8's first migration) is the pre-
+aggregated table every dashboard query in PRD §5.2-§5.4 reads from
+instead of scanning raw `llm_call_events` for any complete historical
+day. Same organization-scoped SELECT policy pattern as `api_keys`/
+`llm_call_events` (join through `project_id` to `projects`); no
+INSERT/UPDATE/DELETE policy for `authenticated`/`anon` — the daily
+rollup job (issue 8.1+) will write via `service_role`, same posture as
+every other backend-written table in this document.
+
+**A real risk here, checked rather than assumed:** PRD §7's stated
+grain is `(project, date, provider, model, customer_id, feature_id)`,
+and issue 8.2's own AC requires untagged events (`customer_id`/
+`feature_id` both null) to still be included in the aggregation, not
+dropped. A plain `unique (project_id, date, provider, model,
+customer_id, feature_id)` constraint does *not* actually enforce that
+grain when both tag columns are null — Postgres treats every `NULL` as
+distinct from every other `NULL` for uniqueness purposes, so two
+untagged rows for the same `(project, date, provider, model)` would
+both be allowed to exist side by side, silently breaking issue 8.3's
+"idempotent upsert" requirement for what will likely be the single most
+common case (a project with no tags configured yet). Fixed with two
+generated columns, `customer_id_key`/`feature_id_key`
+(`generated always as (coalesce(customer_id, '')) stored`), and the
+real unique constraint targets those instead of the raw nullable
+columns.
+
+Verified directly, not assumed correct from the migration alone:
+inserted one untagged row (`project 33333333-...`, `2026-09-01`,
+`openai`/`gpt-5.6-luna`, cost `$1.00`, `call_count 2`), then a second
+insert for the identical grain using `on conflict (project_id, date,
+provider, model, customer_id_key, feature_id_key) do update` (the exact
+upsert shape issue 8.3 will use) with cost `$2.00`, `call_count 4`.
+Result: exactly one row, `total_cost_usd = 3.00`, `call_count = 6` — the
+untagged case collapses correctly instead of duplicating.
+
+Isolation re-test, one rollup row seeded per org's existing test
+project (`33333333-.../Org A`, `44444444-.../Org B`, same fixtures used
+throughout this document): as User A, `select ... from
+public.daily_cost_rollups` returned only Project A's row; as User B,
+only Project B's row. A follow-up `insert` as `authenticated` (User A,
+into User A's own project) correctly failed with `new row violates row-
+level security policy for table "daily_cost_rollups"`, confirming
+writes are denied entirely for that role, matching `llm_call_events`'s
+posture. `get_advisors` (security) came back clean apart from the two
+same pre-existing, unrelated items noted throughout this document
+(`ingestion_dead_letters`'s expected no-policy notice, and the Auth
+leaked-password-protection warning). Both disposable rollup rows were
+deleted after verification.
