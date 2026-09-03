@@ -287,8 +287,26 @@ describe("POST /v1/events", () => {
   // AC2 (issue 6.1): "Endpoint responds within the latency budget...
   // even under a stub implementation". Real auth now sits in the path,
   // but this deps fake is still in-memory (no real network/DB), so the
-  // same generous smoke bound still applies -- the real NFR §10.2
-  // measurement is issue 7.5's load test.
+  // same generous smoke bound still applies.
+  //
+  // Correction, made while closing issue 7.5 (flagged per the Working
+  // Agreement rather than silently fixed): this comment used to claim
+  // "the real NFR §10.2 measurement is issue 7.5's load test." That was
+  // written when POST /v1/events still wrote directly to Postgres
+  // (pre-issue-7.2), so proxy response time and "overhead added to the
+  // customer's LLM call" were the same number. They no longer are.
+  // FR-6.8 has the SDK batch events locally and flush on its own timer,
+  // decoupled from the customer's actual LLM call -- so the overhead
+  // NFR §10.2 actually budgets (50ms p95/150ms p99) is the cost of
+  // pushing one event into an in-memory batch, not the network round
+  // trip to deliver that batch to this proxy later. Issue 7.5's load
+  // test measures the latter (proxy response time under burst load,
+  // useful for the proxy's own capacity planning) but that is a
+  // different quantity from NFR §10.2's SDK-overhead budget, and
+  // shouldn't be compared against it directly. See issue 7.5's
+  // write-up and apps/proxy/src/load-test/cli.ts's header comment for
+  // the full reasoning. A real measurement of NFR §10.2 itself needs an
+  // actual SDK (Epic 9/10) instrumenting a real customer call.
   it("responds near-instantly even with real auth in the path (smoke check)", async () => {
     const app = buildTestApp();
     const start = performance.now();

@@ -111,9 +111,31 @@ same default-deny RLS posture (enabled, no policies) as everything else
 in this project; live-verified that `anon`/`authenticated` cannot write
 to it while `service_role` can — see `docs/RLS.md`.
 
-**Next up:** Epic 7 (Managed Queue), issue 7.5 — load test: simulate a
-burst-traffic spike against the full queue+worker path and confirm zero
-events are lost and the proxy's latency budget (PRD NFR §10.2) holds.
+Issue 7.5 — burst-traffic load test, closing out Epic 7. A self-
+provisioning script (`apps/proxy/src/load-test/`, run via
+`pnpm --filter @volar/proxy load-test`) spins up a fresh org/projects/
+API keys, fires a defined burst (10x normal event rate, spread across
+10 simulated projects so no single API key ever approaches issue 6.5's
+own rate limit), reconciles every sent event against
+`llm_call_events`/`ingestion_dead_letters`, then tears the fixtures
+back down. Live-verified against staging (a shortened run — 20s burst,
+5,000 events): **zero events lost** — all 5,000 landed in
+`llm_call_events`, 0 dead-lettered, 0 missing, even the handful of
+requests the client itself saw a transient network error on. A real
+correction made along the way, flagged rather than silently fixed: an
+old comment in `events.test.ts` claimed proxy response time under load
+*is* PRD NFR §10.2's SDK-overhead measurement — that stopped being true
+once issue 7.2 made the endpoint enqueue-then-respond and FR-6.8's SDK
+batches asynchronously, decoupling proxy latency from the customer's
+actual call. This load test reports proxy latency under burst (a real,
+useful capacity signal — p95 ~2.3s / p99 ~3.0s in the verification run,
+driven by Supabase RPC fan-out contention, not errors) but that number
+is no longer treated as NFR §10.2 itself; a true measurement needs a
+real SDK (Epic 9/10). See `docs/RLS.md`'s "Load test fixtures" section
+and issue 7.5's own delivery write-up for the full reasoning.
+
+**Next up:** Epic 7 (Managed Queue) is complete. Scope the next epic's
+first issue with Vivek.
 
 Per-area technical decisions and verification history: `docs/RLS.md`,
 `docs/SECRETS.md`, `docs/CI.md`, `docs/PRICE_TABLE.md`.

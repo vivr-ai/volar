@@ -526,3 +526,49 @@ through several real visibility-timeout cycles — see
 `supabase-dead-letter-repository.live.test.ts`'s header comment for why
 that split was chosen, matching the precedent set for the enqueue/
 dequeue RPC paths.
+
+## Load test fixtures (issue 7.5)
+
+Issue 7.5's burst-traffic load test needs real organizations/projects/
+API keys that the live auth middleware (issue 6.2) will actually
+accept — synthetic in-memory fixtures don't exercise the deployed
+staging environment the way this issue requires.
+
+**A real course-correction, not a silent decision:** the first attempt
+at this (mid-way through this issue, before `src/load-test/` existed)
+seeded one *persistent* "Load Test Org" with 10 real projects and 10
+real API keys directly via SQL, intending to commit their plaintext
+into this repo so the load-test script could reuse the same keys on
+every run. On reflection that was wrong, for two reasons: it would have
+put a long-lived, genuinely working credential into git history
+indefinitely (this project's own operating rules treat API keys,
+tokens, and passwords as things Claude must never enter into a
+field/file/commit, and a committed plaintext key is exactly that risk
+realized), and it broke from this document's own established
+convention — every fixture recorded above (RLS Test Org A/B, the 3.2/
+6.2/6.6 disposable API-key rows, the 5.1 LLMCallEvent rows) is
+explicitly disposable, deleted immediately after the verification that
+needed it, not kept around as a standing credential. That first
+attempt's seed data (1 organization, 10 projects, 10 API keys) was
+deleted from this live project before any of it was committed — nothing
+from it ever reached git.
+
+**What actually shipped instead:** `apps/proxy/src/load-test/provision-fixtures.ts`
+self-provisions a fresh organization + N projects + N API keys at the
+start of every load-test run (`generateApiKey()`/`hashApiKey()` from
+`packages/shared`, the exact same functions the real signup path would
+use), and tears all of it down again once the run finishes — success or
+failure, via a `try/finally` in the CLI entrypoint. Every run's
+plaintext keys exist only in that run's process memory; none are ever
+written to disk, logged, or committed. This matches the disposable-
+fixture convention above, just automated instead of manual, since this
+fixture (unlike the one-off RLS isolation tests) needs to be recreated
+on every future run rather than seeded once.
+
+The one thing that *is* persistent is the naming convention:
+organizations are named `Load Test Org (issue 7.5) <ISO timestamp>` and
+projects `Load Test Project <index>`, so any load-test-run debris left
+behind by a crashed run (teardown not reached) is easy to identify and
+hand-delete — `delete from public.organizations where name like 'Load
+Test Org%'` cascades through the same FK chain teardownLoadTestFixtures
+itself uses.

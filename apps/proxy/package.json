@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
+    "load-test": "tsx scripts/burst-load-test.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
