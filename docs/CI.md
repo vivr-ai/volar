@@ -129,6 +129,38 @@ using the exact `pnpm@9.15.9` version pinned in the root
 `pnpm install --frozen-lockfile` passes cleanly against the
 regenerated file before committing it.
 
+Once `SUPABASE_SERVICE_ROLE_KEY` was added (see below), a third
+distinct bug surfaced: **Railway's `buildCommand` for this service was
+itself a bare `pnpm --filter @volar/proxy build`** — exactly the
+anti-pattern this doc's own "general rule" section (below) already
+warns about. It bypasses Turborepo's dependency graph, so
+`@volar/shared` was never built before `apps/proxy`'s `tsc` ran against
+it, failing with `error TS2307: Cannot find module '@volar/shared'`.
+This CI.md fix (issue 5.5) was only ever applied to the GitHub Actions
+workflow files — Railway's own build command, a separate piece of
+config, was never updated to match. Fixed by changing Railway's
+`buildCommand` to `pnpm install && pnpm exec turbo run build
+--filter=@volar/proxy` for both environments.
+
+With that fixed, the build finally succeeded end to end — but the
+container crashed immediately on boot with `Error: Node.js detected
+but native WebSocket not found` (thrown inside
+`@supabase/supabase-js`'s `@supabase/realtime-js` dependency, which
+requires Node's native WebSocket support, added in Node 22). Railway
+had been running Node 20 — the minimum this repo's root `package.json`
+declared (`"engines": { "node": ">=20" }`), and Railpack picks the
+*lowest* version satisfying that range, not the latest. This proxy
+never actually uses Supabase Realtime, but `createClient()` still
+constructs a `RealtimeClient` internally as a side effect, so the crash
+happens on every real (non-test-double) client construction, Node <22,
+regardless of whether Realtime features are ever used. Fixed by
+bumping `engines.node` to `>=22` in the root `package.json`, and — for
+consistency, since this exact crash would also hit any CI run that
+ever exercises a real `createClient()` call, e.g. an unskipped
+`*.live.test.ts` — bumping `node-version` from 20 to 22 in all three
+GitHub Actions workflows (`dashboard-ci.yml`, `proxy-ci.yml`,
+`shared-ci.yml`) to match.
+
 **Still blocking, and outside what Claude can fix:** Railway has zero
 environment variables configured on the `volar` service in either
 environment (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, etc.), so
@@ -139,7 +171,7 @@ public URL). `SUPABASE_SERVICE_ROLE_KEY` is a credential — per this
 project's own security posture (`docs/SECRETS.md`) and Claude's own
 operating rules, it must be set by Vivek directly in Railway's own
 Variables UI, never typed or pasted through Claude. See this issue's
-delivery write-up for the exact steps.
+delivery write-up for the exact steps and the outcome once it was set.
 
 ## The general rule going forward
 
