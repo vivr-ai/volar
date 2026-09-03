@@ -80,6 +80,67 @@ the module-resolution errors persist, that points at sync-related
 corruption rather than a simple stale lockfile, and is worth flagging
 rather than repeatedly re-running install.
 
+## Railway deploy failures — build root + lockfile drift (found while scoping issue 7.5)
+
+Issue 7.5 (load test against staging) requires a working deployed
+proxy. Checking Railway's actual deploy history (never done before this
+point) revealed every deploy of the `volar` service, on both `staging`
+and `production`, had failed since 2026-08-09 (issue 5.2's commit) —
+long before this session, and undiscovered because nothing in the
+process up to now checked deploy status after a push. Two independent,
+real bugs, both now fixed:
+
+**1. Wrong build root hid the pnpm workspace from Railway.** The
+service's `rootDirectory` was set to `apps/proxy`, but `pnpm-lock.yaml`
+and `pnpm-workspace.yaml` live at the monorepo root — one level up.
+Scoped that way, Railway's build tool (Railpack) never saw them, so it
+couldn't detect this is a pnpm workspace, fell back to `npm install`
+against `apps/proxy/package.json`, and failed immediately with
+`npm error Unsupported URL Type "workspace:": workspace:*` — npm has no
+concept of the `workspace:*` protocol pnpm uses for internal package
+links. The service's `buildCommand`/`startCommand` (`pnpm install &&
+pnpm --filter @volar/proxy build` / `pnpm --filter @volar/proxy start`)
+were already written assuming a repo-root working directory; only
+`rootDirectory` was wrong. Fixed by setting `rootDirectory` to the repo
+root for both environments — confirmed via fresh build logs that
+Railway now correctly detects pnpm and runs `pnpm install
+--frozen-lockfile` as its own install step, before the custom build
+command even runs.
+
+**2. `pnpm-lock.yaml` had drifted out of sync with `package.json`.**
+Once (1) was fixed, the build got further and hit a second, real
+failure: `ERR_PNPM_OUTDATED_LOCKFILE` — the committed lockfile didn't
+have entries matching `packages/internal-cli/package.json`'s current
+dependencies (`@volar/config`, `@types/node`, `eslint`, `tsx`,
+`typescript`, `vitest`, `@supabase/supabase-js`). This means at some
+point that file was edited without a real `pnpm install` run afterward
+to update the lockfile — plausible given this session's own
+`bash`-sandbox-can't-mount-the-real-repo constraint (see
+`WORKING_AGREEMENT.md`'s known environment quirks) meant every local
+verification pass this project has ever run used `npm install` in an
+isolated scratch copy, not `pnpm install --frozen-lockfile` against the
+real lockfile — so this drift was never caught locally, only by
+Railway's own stricter frozen-lockfile install.
+
+Fixed by regenerating `pnpm-lock.yaml` from the current `package.json`
+files (`pnpm install --no-frozen-lockfile` in an isolated environment,
+using the exact `pnpm@9.15.9` version pinned in the root
+`package.json`'s `packageManager` field), then verifying
+`pnpm install --frozen-lockfile` passes cleanly against the
+regenerated file before committing it.
+
+**Still blocking, and outside what Claude can fix:** Railway has zero
+environment variables configured on the `volar` service in either
+environment (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, etc.), so
+even a successful build will crash at boot (`index.ts` throws at
+startup if `SUPABASE_SERVICE_ROLE_KEY` is unset, per issue 6.2).
+`SUPABASE_URL` was set directly (not a secret, just the project's
+public URL). `SUPABASE_SERVICE_ROLE_KEY` is a credential — per this
+project's own security posture (`docs/SECRETS.md`) and Claude's own
+operating rules, it must be set by Vivek directly in Railway's own
+Variables UI, never typed or pasted through Claude. See this issue's
+delivery write-up for the exact steps.
+
 ## The general rule going forward
 
 **Any script in a workspace package that consumes another workspace
