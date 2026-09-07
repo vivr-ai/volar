@@ -623,3 +623,62 @@ same pre-existing, unrelated items noted throughout this document
 (`ingestion_dead_letters`'s expected no-policy notice, and the Auth
 leaked-password-protection warning). Both disposable rollup rows were
 deleted after verification.
+
+## Default write-grant hardening (found via `supabase db pull`, not tied to a specific issue)
+
+Running `supabase db pull` for the first time in this project (while
+closing out issue 8.0) surfaced a real, previously-undetected gap: this
+Supabase project carries a project-creation-time default-privilege rule
+that automatically grants `anon`/`authenticated` broad table-level
+`INSERT`/`UPDATE`/`DELETE` (and `ALL` on routines) on every object
+created in `public` — including every table this project has ever
+migrated, and including `daily_cost_rollups` the moment it was created
+a few migrations ago.
+
+This is the same root-cause class of gap already documented twice
+above — issue 3.4's `upsert_customer_tag`/`upsert_feature_tag` functions
+and issue 7.2's `enqueue_ingestion_event` — but both of those fixes only
+revoked access from the one function already created at the time,
+never the underlying default-privilege rule itself. So the gap kept
+reopening for every table and function created afterward, silently,
+with no live test ever catching it — because every RLS test in this
+document (correctly) tests the *policy* layer, never the *grant* layer
+underneath it. RLS's default-deny (a table with RLS enabled and zero
+write policies denies writes regardless of table grants) has been doing
+100% of the real protective work the whole time, which is why every
+negative check above already correctly failed with "violates row-level
+security policy" — but that means protection has only ever had one
+layer, not two.
+
+Fixed in `20260907120000_harden_default_write_grants.sql`, revoke-only,
+three parts: (1) the default-privilege rule itself, so no future table
+or function reopens this; (2) a one-time sweep revoking
+`INSERT`/`UPDATE`/`DELETE` from `anon`/`authenticated` on every table
+that exists today; (3) the same sweep for `ALL` on every function.
+`SELECT` and sequence privileges were deliberately left untouched —
+every read path in this app relies on `anon`/`authenticated` being able
+to attempt a `SELECT` at all, with RLS policies doing the actual
+row-filtering, and this schema has no sequence-backed columns for
+either role to meaningfully exploit.
+
+Verified directly, in this order:
+1. As `authenticated` (User A): `select id, name from
+   public.organizations` still returned exactly Org A's row — SELECT
+   access genuinely unaffected.
+2. As `authenticated` (User A), into User A's own project: the same
+   `insert` that previously failed with "violates row-level security
+   policy" now fails one layer earlier — `permission denied for table
+   daily_cost_rollups` (SQLSTATE 42501) — confirming the grant layer
+   itself now blocks it, not just the policy layer.
+3. As `anon`: `select public.upsert_customer_tag(...)` — already
+   individually locked down since issue 3.4 — still correctly fails
+   with `permission denied for function upsert_customer_tag`,
+   confirming this migration didn't disturb that existing fix.
+4. As `service_role` (`reset role`): the same insert that failed for
+   `authenticated` succeeded normally, confirming the app's actual
+   write path (every write in this codebase goes through
+   `service_role`, per `docs/SECRETS.md`) is completely unaffected. The
+   disposable row was deleted afterward.
+
+`get_advisors` (security) clean apart from the same two pre-existing,
+unrelated items noted throughout this document.
