@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
+    "dev:rollup": "tsx src/rollup.ts",
     "load-test": "tsx scripts/burst-load-test.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
+    "start:rollup": "node dist/rollup.js",
     "lint": "eslint src",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
